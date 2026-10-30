@@ -209,3 +209,20 @@ it("keeps interleaved native child counters apart when BB reuses the parent prov
   const report = buildReport(ledgerEntries(restored, "codex", harness), null);
   expect(report.tokens.input).toBe(275); expect(report.tokens.output).toBe(25); expect(report.calls).toBe(3);
 });
+
+it("keeps a parent's total from counting again when an unmapped native child shares its id", () => {
+  // No turn/started names the child, so only the totals tell the two counters apart.
+  const first = totals({ totalTokens: 100, inputTokens: 90, outputTokens: 10 });
+  const child = totals({ totalTokens: 80, inputTokens: 75, outputTokens: 5 });
+  const next = totals({ totalTokens: 220, inputTokens: 200, outputTokens: 20 });
+  const last = totals({ totalTokens: 120, inputTokens: 110, outputTokens: 10 });
+  const r = reportOf("codex", [request("go", "gpt-5.5"), usage(first), usage(child), usage(next, last)]);
+  expect(r.tokens.input).toBe(275); expect(r.tokens.output).toBe(25); expect(r.calls).toBe(3);
+});
+
+it("counts the growth of a counter whose calls were missed, when no counter continues it", () => {
+  const first = totals({ totalTokens: 100, inputTokens: 90, outputTokens: 10 });
+  const missed = totals({ totalTokens: 150, inputTokens: 135, outputTokens: 15 });
+  const r = reportOf("codex", [request("go", "gpt-5.5"), usage(first), usage(missed, totals({ totalTokens: 10, inputTokens: 9, outputTokens: 1 }))]);
+  expect(r.tokens.input).toBe(135); expect(r.tokens.output).toBe(15);
+});

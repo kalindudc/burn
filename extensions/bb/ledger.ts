@@ -89,14 +89,14 @@ const countersOf = (session: SessionState): Totals[] => (session.total === null 
  * worker restarts, so a lower total, or one equal to its own last call, counts in full.
  */
 function addedBy(counters: readonly Totals[], total: Totals, last: Totals): { added: Totals; counters: Totals[] } {
-  // A repeat of a counter's total adds nothing.
-  const index = counters.findIndex((c) => same(c, total) || c.totalTokens + last.totalTokens === total.totalTokens);
+  const index = counters.findIndex((c) => c.totalTokens + last.totalTokens === total.totalTokens);
   if (index >= 0) return { added: minus(total, counters[index] as Totals), counters: [total, ...counters.filter((_, i) => i !== index)] };
+  // Only the newest counter's exact total is a repeat: an older counter can share a total with a real call.
   const newest = counters[0];
-  if (newest === undefined || same(total, last) || total.totalTokens < newest.totalTokens) {
+  if (newest === undefined || (newest.totalTokens > 0 && same(total, last) && !same(total, newest)) || total.totalTokens < newest.totalTokens) {
     return { added: total, counters: [total, ...counters].slice(0, COUNTERS) };
   }
-  // No counter continues, so calls were missed on the newest one: count its growth.
+  // No counter continues, so calls were missed on the newest one: count its growth. A repeat of it adds nothing.
   return { added: minus(total, newest), counters: [total, ...counters.slice(1)] };
 }
 

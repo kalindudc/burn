@@ -226,3 +226,12 @@ it("counts the growth of a counter whose calls were missed, when no counter cont
   const r = reportOf("codex", [request("go", "gpt-5.5"), usage(first), usage(missed, totals({ totalTokens: 10, inputTokens: 9, outputTokens: 1 }))]);
   expect(r.tokens.input).toBe(135); expect(r.tokens.output).toBe(15);
 });
+
+it("counts a call whose total equals an older counter's total, unless it repeats the newest counter", () => {
+  const older = totals({ totalTokens: 100, inputTokens: 90, outputTokens: 10 });
+  const newer = totals({ totalTokens: 200, inputTokens: 180, outputTokens: 20 });
+  const r = reportOf("codex", [request("go", "gpt-5.5"), usage(older), usage(newer), usage(older)]);
+  expect(r.tokens.input).toBe(360); expect(r.tokens.output).toBe(40); expect(r.calls).toBe(3);
+  const repeat = reportOf("codex", [request("go", "gpt-5.5"), usage(older), usage(older)]);
+  expect(repeat.tokens.input).toBe(90); expect(repeat.calls).toBe(1);
+});

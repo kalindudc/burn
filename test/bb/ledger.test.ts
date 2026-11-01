@@ -235,3 +235,34 @@ it("counts a call whose total equals an older counter's total, unless it repeats
   const repeat = reportOf("codex", [request("go", "gpt-5.5"), usage(older), usage(older)]);
   expect(repeat.tokens.input).toBe(90); expect(repeat.calls).toBe(1);
 });
+
+it("keeps a waiting parent's counter when more unmapped native children start than the ledger keeps", () => {
+  const split = (n: number) => totals({ totalTokens: n, inputTokens: n - n / 10, outputTokens: n / 10 });
+  const rows = [request("go", "gpt-5.5"), usage(split(1000))];
+  for (const n of [20, 30, 40, 50, 60, 70, 80, 90]) rows.push(usage(split(n)));
+  rows.push(usage(split(1050), split(50)));
+  const r = reportOf("codex", rows);
+  // The ninth counter drops the smallest child, never the parent, so the parent's next call adds only its own 50.
+  expect(r.tokens.input).toBe(900 + 396 + 45); expect(r.tokens.output).toBe(100 + 44 + 5); expect(r.calls).toBe(10);
+});
+
+it("keeps at most eight counters for one provider id, dropping the smallest", () => {
+  const ledger = newLedger();
+  const rows = [request("go", "gpt-5.5")];
+  for (let n = 10; n <= 100; n += 10) rows.push(usage(totals({ totalTokens: n, inputTokens: n - n / 10, outputTokens: n / 10 })));
+  addRows(ledger, rows, harnessOf("codex"));
+  const session = ledger.state.sessions.s1;
+  expect(session?.total?.totalTokens).toBe(100);
+  expect(session?.earlier?.map((c) => c.totalTokens)).toEqual([90, 80, 70, 60, 50, 40, 30]);
+});
+
+it("replaces the newest counter, keeping the older ones, when it counts calls that were missed", () => {
+  const ledger = newLedger();
+  const parent = totals({ totalTokens: 100, inputTokens: 90, outputTokens: 10 });
+  const child = totals({ totalTokens: 80, inputTokens: 75, outputTokens: 5 });
+  const missed = totals({ totalTokens: 150, inputTokens: 135, outputTokens: 15 });
+  addRows(ledger, [request("go", "gpt-5.5"), usage(parent), usage(child), usage(missed, totals({ totalTokens: 10, inputTokens: 9, outputTokens: 1 }))], harnessOf("codex"));
+  const session = ledger.state.sessions.s1;
+  expect(session?.total?.totalTokens).toBe(150);
+  expect(session?.earlier?.map((c) => c.totalTokens)).toEqual([100]);
+});

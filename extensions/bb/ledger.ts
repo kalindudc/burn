@@ -74,19 +74,31 @@ function minus(a: Totals, b: Totals): Totals {
 const sessionOf = (state: LedgerState, id: string): SessionState =>
   (Object.hasOwn(state.sessions, id) ? state.sessions[id] : undefined) ?? { total: null, usd: null, costed: false };
 
-/** Counters one provider id keeps at once; the oldest drops past this. */
+/** Counters one provider id keeps at once; see withCounter for which drops past this. */
 const COUNTERS = 8;
 
 /** A session's counters, newest first: its total, then the earlier ones. */
 const countersOf = (session: SessionState): Totals[] => (session.total === null ? [] : [session.total, ...(session.earlier ?? [])]);
 
 /**
+ * The counters with a new one in front. Past the cap the smallest older counter
+ * drops, not the one idle longest: a dropped counter's next call counts its whole
+ * total again, and a parent waiting on its children is both the idlest and the largest.
+ */
+function withCounter(total: Totals, counters: readonly Totals[]): Totals[] {
+  if (counters.length < COUNTERS) return [total, ...counters];
+  const smallest = counters.reduce((min, c, i) => (c.totalTokens < (counters[min] as Totals).totalTokens ? i : min), 0);
+  return [total, ...counters.filter((_, i) => i !== smallest)];
+}
+
+/**
  * What a provider id's new total adds, and the counters it leaves. A total that
  * continues a counter adds what that counter gained: its total plus this call's
  * tokens is the new total. This holds per counter, so a native child's calls under
- * the parent's id do not count the parent's total again. Otherwise the total is a
- * restart: bridges that sum `last` in worker memory start again from zero when the
- * worker restarts, so a lower total, or one equal to its own last call, counts in full.
+ * the parent's id do not count the parent's total again. Otherwise a lower total, or
+ * one equal to its own last call, is a restart and counts in full: bridges that sum
+ * `last` in worker memory start again from zero when the worker restarts. Any other
+ * total counts the newest counter's growth, which covers missed calls and repeats.
  */
 function addedBy(counters: readonly Totals[], total: Totals, last: Totals): { added: Totals; counters: Totals[] } {
   const index = counters.findIndex((c) => c.totalTokens + last.totalTokens === total.totalTokens);
@@ -94,7 +106,7 @@ function addedBy(counters: readonly Totals[], total: Totals, last: Totals): { ad
   // Only the newest counter's exact total is a repeat: an older counter can share a total with a real call.
   const newest = counters[0];
   if (newest === undefined || (newest.totalTokens > 0 && same(total, last) && !same(total, newest)) || total.totalTokens < newest.totalTokens) {
-    return { added: total, counters: [total, ...counters].slice(0, COUNTERS) };
+    return { added: total, counters: withCounter(total, counters) };
   }
   // No counter continues, so calls were missed on the newest one: count its growth. A repeat of it adds nothing.
   return { added: minus(total, newest), counters: [total, ...counters.slice(1)] };

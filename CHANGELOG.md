@@ -4,6 +4,16 @@ Notable changes to Burn, newest first.
 
 Burn follows [semantic versioning](https://semver.org). Releases from 0.4.0 on are tagged `vX.Y.Z` in this repository; earlier versions were not tagged. Each release's commit message has the full detail, including how the release was checked.
 
+## 0.9.2 - 2026-11-01
+
+Native-agent counters survive a child sharing its parent's id and a parent waiting on a large fan-out, and bb no longer throws when it resolves pi's env outside a thread. The counter rework is by [Oleg](https://github.com/zom-2018) ([#5](https://github.com/kalindudc/burn/pull/5)), and the env fix is by [Nikolai Berezovskii](https://github.com/brzvsk) ([#7](https://github.com/kalindudc/burn/pull/7)).
+
+- **A native child that shares its parent's id no longer recounts the parent.** A child's usage can arrive under the parent's provider session id without a turn event mapping it to a child, so its counter interleaved with the parent's on one session and every switch back re-added the parent's whole total. The ledger keeps a provider id's recent counters and continues whichever one the new total extends; a total that extends none still counts in full after a restart, or the growth of the newest counter when calls were missed, and only the newest counter's exact total counts as a repeat.
+- **A parent waiting on a fan-out keeps its own counter.** Each provider id keeps up to eight counters, and past that the one idle longest dropped — during a fan-out of eight or more unmapped native children that is the parent waiting on them, so its next call counted its whole total again (2160 input tokens instead of 1341 in the new test). The smallest older counter drops instead: it re-adds the least, and the new counter never drops.
+- **bb contributes no pi env when it is asked outside a thread.** bb also resolves provider env for pi with no thread, for example when the pi provider is enabled and starts on a host; the per-thread token then hashed null and every such call threw — over a thousand handler errors in a day on one machine. With no thread there is nothing to report for, so Burn contributes nothing.
+
+The new tests cover counter continuation and repeats, the eight-counter cap with the replaced-counter path, and the no-thread env. All 625 tests pass in 42 files and `tsc --noEmit` is clean. Settings, stored keys and the plugin database's tables are the same as in 0.9.1.
+
 ## 0.9.1 - 2026-10-30
 
 The chip's working animation follows the thread again, and busy hosts stop piling up overlapping reads.

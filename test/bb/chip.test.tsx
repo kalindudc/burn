@@ -4,6 +4,7 @@ import { act, fireEvent, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { chipView, STALE_MS } from "../../extensions/bb/chip.js";
 import type { rpcContract, UsageAnswer } from "../../extensions/bb/contract.js";
+import { READ_TIMEOUT_MS, WORKING_REFETCH_MS } from "../../extensions/bb/usage.js";
 import { buildReport } from "../../src/report.js";
 import { modelRow, sampleReport } from "../helpers.js";
 import { answer, backend, THREAD } from "./fixtures.js";
@@ -113,18 +114,23 @@ describe("chipView", () => {
     expect(over.label).toContain("$4.82 of $4");
   });
 
-  it("dims a running thread that stopped reporting, with its age", () => {
+  it("keeps a quiet working thread working, and says in the tooltip how long it has been quiet", () => {
     const stale = view(answer({ report: sampleReport({ running: true }), reportedAt: now - STALE_MS - 60_000 }));
-    expect(stale).toMatchObject({ stale: true, running: false, suffix: { kind: "age", text: "· 6m" } });
-    expect(stale.title).toBe("Thread cost $4.82. Burn has seen no new usage for 6m while the thread was working.");
+    expect(stale).toMatchObject({ stale: true, running: true, suffix: { kind: "delta", text: "+$0.31" } });
+    expect(stale.title).toBe("Thread cost $4.82, the thread is working. Burn has seen no new usage for 6m. Click for the breakdown.");
+    expect(view(answer({ report: sampleReport({ running: false }), reportedAt: now - STALE_MS - 60_000 }))).toMatchObject({
+      stale: false,
+      title: "Thread cost $4.82. Click for the breakdown.",
+    });
     expect(view(answer({ report: sampleReport({ running: true }), reportedAt: now - 1000 })).title).toBe(
       "Thread cost $4.82, the thread is working. Click for the breakdown.",
     );
   });
 
-  it("never dims a thread read from bb's usage events, whose turn can run for minutes before bb records its usage", () => {
+  it("never calls a thread read from bb's usage events quiet, whose turn can run for minutes before bb records its usage", () => {
     const long = view(answer({ source: "events", report: sampleReport({ running: true }), reportedAt: now - STALE_MS - 60_000 }));
     expect(long).toMatchObject({ stale: false, running: true });
+    expect(long.title).not.toContain("no new usage");
   });
 
   it("marks a list-price estimate with a tilde and says so", () => {
@@ -132,7 +138,7 @@ describe("chipView", () => {
     expect(view(guess)).toMatchObject({ value: "~$4.82" });
     expect(view(guess).title).toBe("Thread cost ~$4.82. Click for the breakdown. Estimated from list prices.");
     const stale = view(answer({ report: sampleReport({ estimated: true, running: true }), reportedAt: now - STALE_MS - 60_000 }));
-    expect(stale.title).toMatch(/while the thread was working\. Estimated from list prices\.$/);
+    expect(stale.title).toMatch(/no new usage for 6m\. Click for the breakdown\. Estimated from list prices\.$/);
     expect(view(answer()).title).not.toContain("Estimated");
   });
 
@@ -234,6 +240,92 @@ describe("Burn chip", () => {
     await slot.behavior.setRealtimeConnectionState("connected");
     expect(await slot.findByRole("button", { name: /Thread cost \$4\.82/ })).toBeTruthy();
     expect(server.callsTo("usage")).toHaveLength(3);
+  });
+
+  it("keeps the working animation and full colour on a working thread that has been quiet for minutes", async () => {
+    const quiet = answer({ report: sampleReport({ running: true }), reportedAt: Date.now() - STALE_MS - 60_000 });
+    const pill = await chipButton(await renderChip(backend(() => quiet)));
+    expect(pill.dataset.running).toBe("");
+    expect(pill.querySelector("[data-burn-shimmer]")).not.toBeNull();
+    expect(pill.className).not.toContain("opacity-");
+    expect(pill.getAttribute("title")).toBe("Thread cost $4.82, the thread is working. Burn has seen no new usage for 6m. Click for the breakdown.");
+  });
+
+  it("stops waiting on a read that never answers, so a signal that came meanwhile reads again", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let calls = 0;
+      const server = backend(undefined, {
+        usage: () => (++calls === 1 ? new Promise<never>(() => undefined) : answer()),
+      });
+      const slot = await renderChip(server);
+      await slot.findByRole("button", { name: /waiting for the first model call/ });
+      await slot.behavior.emitRealtime("usage", { threadId: THREAD });
+      expect(server.callsTo("usage")).toHaveLength(1);
+      await act(async () => {
+        vi.advanceTimersByTime(READ_TIMEOUT_MS);
+      });
+      expect(await slot.findByRole("button", { name: /Thread cost \$4\.82/ })).toBeTruthy();
+      expect(server.callsTo("usage")).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("takes a read's late answer when nothing newer was asked, and drops it when a newer read answered", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const late: Array<(a: UsageAnswer) => void> = [];
+      const hang = () => new Promise<UsageAnswer>((resolve) => void late.push(resolve));
+
+      const alone = await renderChip(backend(undefined, { usage: hang }));
+      await alone.findByRole("button", { name: /waiting for the first model call/ });
+      await act(async () => {
+        vi.advanceTimersByTime(READ_TIMEOUT_MS);
+      });
+      await act(async () => late[0]?.(answer()));
+      expect(await alone.findByRole("button", { name: /Thread cost \$4\.82/ })).toBeTruthy();
+
+      let calls = 0;
+      const newer = answer({ report: sampleReport({ cost: costOf(9.5) }) });
+      const server = backend(undefined, { usage: () => (++calls === 1 ? hang() : newer) });
+      const slot = await renderChip(server);
+      await slot.findByRole("button", { name: /waiting for the first model call/ });
+      await slot.behavior.emitRealtime("usage", { threadId: THREAD });
+      await act(async () => {
+        vi.advanceTimersByTime(READ_TIMEOUT_MS);
+      });
+      expect(await slot.findByRole("button", { name: /Thread cost \$9\.50/ })).toBeTruthy();
+      await act(async () => late[1]?.(answer()));
+      await settle();
+      expect((await chipButton(slot)).getAttribute("aria-label")).toContain("$9.50");
+      expect(server.callsTo("usage")).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reads a working thread again every minute with no signal, and stops once it is idle", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let running = true;
+      const server = backend(() => answer({ report: sampleReport({ running }), reportedAt: Date.now() }));
+      const slot = await renderChip(server);
+      await vi.waitFor(async () => expect((await chipButton(slot)).dataset.running).toBe(""));
+      expect(server.callsTo("usage")).toHaveLength(1);
+      running = false;
+      await act(async () => {
+        vi.advanceTimersByTime(WORKING_REFETCH_MS);
+      });
+      await vi.waitFor(async () => expect((await chipButton(slot)).dataset.running).toBeUndefined());
+      expect(server.callsTo("usage")).toHaveLength(2);
+      await act(async () => {
+        vi.advanceTimersByTime(5 * WORKING_REFETCH_MS);
+      });
+      expect(server.callsTo("usage")).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

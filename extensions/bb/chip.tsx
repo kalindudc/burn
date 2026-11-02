@@ -14,7 +14,7 @@ import { readPrefs } from "./prefs.js";
 import { copySummary } from "./summary.js";
 import { useNow, useUsage } from "./usage.js";
 
-/** A running thread whose report is this old has stopped reporting. */
+/** A working thread whose figures have not changed for this long says so in the chip's tooltip. */
 export const STALE_MS = 5 * 60_000;
 const FRESH_MS = 6000;
 const FADE_MS = 600;
@@ -25,11 +25,15 @@ export interface ChipView {
   tone: ChipTone;
   value: string;
   unit: string | null;
-  /** The delta, the budget (" / $10") or the age of a report that stopped coming. */
-  suffix: { kind: "delta" | "budget" | "age"; text: string } | null;
+  /** The delta or the budget (" / $10"). */
+  suffix: { kind: "delta" | "budget"; text: string } | null;
   /** How far along the budget (at most 1), for the line under a chip near or over it. */
   progress: number | null;
   running: boolean;
+  /**
+   * Working with no new usage for STALE_MS. Only the tooltip says so: a long tool call is quiet
+   * too, and bb, not the log, says whether the thread is working.
+   */
   stale: boolean;
   tokenOnly: boolean;
   label: string;
@@ -64,14 +68,14 @@ export function chipView(answer: UsageAnswer | null, opts: { now: number; fresh:
   const budget = answer?.budget?.amount ?? null;
   const state = tokenOnly ? "none" : budgetState(report.cost.total, budget);
   const tone: ChipTone = state === "near" || state === "over" ? state : "default";
-  const running = report.running && !stale;
+  const running = report.running;
   let suffix: ChipView["suffix"] = null;
-  if (stale) suffix = { kind: "age", text: `· ${formatAgo(reportedAt, opts.now)}` };
-  else if (tone !== "default" && budget !== null) suffix = { kind: "budget", text: `/ ${formatBudget(budget)}` };
+  if (tone !== "default" && budget !== null) suffix = { kind: "budget", text: `/ ${formatBudget(budget)}` };
   else if (opts.chipShows === "delta" && !tokenOnly && (running || opts.fresh)) suffix = { kind: "delta", text: formatDelta(answer?.family.lastTurnCost ?? report.lastTurnCost) };
   const total = `${value}${tokenOnly ? " tok" : ""}`;
   const budgetNote = budget !== null && !tokenOnly ? ` of ${formatBudget(budget)}` : "";
   const estimate = report.estimated ? " Estimated from list prices." : "";
+  const quiet = stale ? ` Burn has seen no new usage for ${formatAgo(reportedAt, opts.now)}.` : "";
   return {
     tone,
     value,
@@ -82,9 +86,7 @@ export function chipView(answer: UsageAnswer | null, opts: { now: number; fresh:
     stale,
     tokenOnly,
     label: `Thread cost ${total}${budgetNote}. Click for the breakdown.`,
-    title: stale
-      ? `Thread cost ${total}. Burn has seen no new usage for ${formatAgo(reportedAt, opts.now)} while the thread was working.${estimate}`
-      : `Thread cost ${total}${budgetNote}${running ? ", the thread is working" : ""}. Click for the breakdown.${estimate}`,
+    title: `Thread cost ${total}${budgetNote}${running ? ", the thread is working" : ""}.${quiet} Click for the breakdown.${estimate}`,
   };
 }
 
@@ -177,7 +179,6 @@ function BurnChip({ threadId, answer, placement }: { threadId: string; answer: U
             placement === "compact" ? "size-7 justify-center" : "gap-1 pr-2 pl-1.5",
             placement === "footer" ? "h-5" : placement === "header" && "h-6",
             TONES[view.tone].chip,
-            view.stale && "opacity-60",
           )}
         >
           <ChipFace view={view} fresh={fresh} placement={placement} />

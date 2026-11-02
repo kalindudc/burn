@@ -22,6 +22,10 @@ const FACTS_CONCURRENCY = 32;
 const HOST_RETRY_MS = 60_000;
 const HOST_TIMEOUT_MS = 25_000;
 const SESSIONS_MAX = 32;
+/** bb's most thread events in one `threads.events.list` page, and its default. */
+const EVENTS_PAGE = 100;
+/** Lookups of one thread in a row before Burn keeps what it found, though the thread started again meanwhile. */
+const LOOKUP_TRIES = 3;
 // Room for every thread a month of use touches: a scan over more threads than a cache holds evicts each entry just before it is read again.
 const CACHE_MAX = 5000;
 /** A held report takes about 10 KB, so fewer are kept than the small per-thread facts. */
@@ -72,6 +76,8 @@ interface Facts {
   stems: Set<string>;
   /** The lookup found no session id of its own, only the thread-id fallback, so it is worth repeating soon. */
   retry?: boolean;
+  /** A thread event made these out of date: they still match log changes, but the next read looks the thread up again. */
+  outdated?: boolean;
 }
 
 const logSchema = z.object({ report: usageReportSchema, at: z.number() });
@@ -201,32 +207,53 @@ export function createReportSource(
     }
     const hostId = row.hostKnown ? row.hostId : (await bb.sdk.environments.get({ environmentId: row.environmentId })).hostId;
     if (hostId === null) return { at: now(), hostId: null, providerId: row.providerId, sessionIds: [], stems: new Set() };
-    const rows = await bb.sdk.threads.events.list({ threadId, types: ["thread/identity"] });
-    const identities = rows.flatMap((row) => {
-      const id = (row.data as { providerThreadId?: unknown } | null)?.providerThreadId;
-      return typeof id === "string" && id !== "" ? [id] : [];
-    });
     // The thread id too, for a session named after the thread rather than an identity.
-    const sessionIds = [...new Set([...identities, threadId])].slice(-SESSIONS_MAX);
+    const sessionIds = [...new Set([...(await identitiesOf(threadId)), threadId])].slice(-SESSIONS_MAX);
     // Only pi's bridge names its session files after these ids.
     const stems = reader === "pi-log" ? new Set(sessionIds.map(sessionStem)) : new Set<string>();
     let parentSessionIds: string[] | undefined;
     if (reader === "claude-log" && row.sourceThreadId) {
-      const parentRows = await bb.sdk.threads.events.list({ threadId: row.sourceThreadId, types: ["thread/identity"] });
-      parentSessionIds = [
-        ...new Set(
-          parentRows.flatMap((r) => {
-            const id = (r.data as { providerThreadId?: unknown }).providerThreadId;
-            return typeof id === "string" ? [id] : [];
-          }),
-        ),
-      ].slice(-32);
+      parentSessionIds = [...new Set(await identitiesOf(row.sourceThreadId))].slice(-SESSIONS_MAX);
     }
     return { at: now(), hostId, providerId: row.providerId, sessionIds, stems, since: row.since, parentSessionIds };
   }
 
+  /**
+   * Every session id bb recorded for the thread, oldest first. bb answers a page of 100 events from
+   * the oldest, and a thread that has been resumed many times has more, its newest sessions last.
+   */
+  async function identitiesOf(threadId: string): Promise<string[]> {
+    const ids: string[] = [];
+    let after: number | null = null;
+    for (;;) {
+      const page = await bb.sdk.threads.events.list({
+        threadId,
+        types: ["thread/identity"],
+        order: "asc",
+        limit: String(EVENTS_PAGE),
+        ...(after !== null ? { afterSeq: String(after) } : {}),
+      });
+      for (const row of page) {
+        const id = (row.data as { providerThreadId?: unknown } | null)?.providerThreadId;
+        if (typeof id === "string" && id !== "") ids.push(id);
+      }
+      const last = page.at(-1);
+      // A page that does not move forward would repeat forever.
+      if (page.length < EVENTS_PAGE || last === undefined || (after !== null && last.seq <= after)) return ids;
+      after = last.seq;
+    }
+  }
+
   /** The lookup under way per thread, so a caller joins it instead of asking bb again. */
   const looking = new Map<string, Promise<Facts>>();
+  // Bumped each time a thread starts, so a lookup that began before then looks again for a session it may have missed.
+  const starts = new Map<string, number>();
+
+  /** Keeps the thread's details, so a change to a log it already has still matches, but makes the next read look it up again. */
+  function outdate(threadId: string): void {
+    const held = facts.get(threadId);
+    if (held) remember(facts, threadId, { ...held, outdated: true });
+  }
 
   /**
    * A new thread's pi session file is named after a session id bb may not have recorded yet.
@@ -243,7 +270,7 @@ export function createReportSource(
       retryTimers.delete(threadId);
       // An idle thread will look up again when it next starts; only a working one needs the signal now.
       if (!facts.get(threadId)?.retry || statuses.get(threadId) !== "active") return;
-      facts.delete(threadId);
+      outdate(threadId);
       invalidate(threadId);
       opts.onChange([threadId]);
     }, retryMs);
@@ -253,23 +280,30 @@ export function createReportSource(
 
   async function factsOf(threadId: string): Promise<Facts> {
     const held = facts.get(threadId);
-    if (held && now() - held.at < (held.retry ? retryMs : FACTS_TTL_MS)) return held;
+    if (held && !held.outdated && now() - held.at < (held.retry ? retryMs : FACTS_TTL_MS)) return held;
     const under = looking.get(threadId);
     if (under) return under;
     const run = (async (): Promise<Facts> => {
       let found: Facts;
-      try {
-        found = await lookUp(threadId);
-      } catch (err) {
-        bb.log.warn(`looking up thread ${threadId} failed, so Burn reads no session log for it: ${message(err)}`);
-        found = { at: now(), hostId: null, providerId: null, sessionIds: [], stems: new Set(), retry: true };
+      let overtaken = false;
+      for (let tries = 1; ; tries++) {
+        const started = starts.get(threadId) ?? 0;
+        try {
+          found = await lookUp(threadId);
+        } catch (err) {
+          bb.log.warn(`looking up thread ${threadId} failed, so Burn reads no session log for it: ${message(err)}`);
+          found = { at: now(), hostId: null, providerId: null, sessionIds: [], stems: new Set(), retry: true };
+        }
+        overtaken = (starts.get(threadId) ?? 0) !== started;
+        if (!overtaken || tries >= LOOKUP_TRIES) break;
       }
       const provisional =
         found.providerId !== null &&
         harnessOf(found.providerId).reader === "pi-log" &&
         found.sessionIds.length === 1 &&
         found.sessionIds[0] === threadId;
-      found = { ...found, retry: found.retry === true || provisional };
+      // A thread that started again during the last try may have a session this lookup missed; the next read looks again.
+      found = { ...found, retry: found.retry === true || provisional, ...(overtaken ? { outdated: true } : {}) };
       if (!provisional) retryAttempts.delete(threadId);
       remember(facts, threadId, found);
       if (found.retry && statuses.get(threadId) === "active") scheduleRetry(threadId);
@@ -409,8 +443,11 @@ export function createReportSource(
   bb.events.on("thread.active", ({ thread }) => {
     // A thread that just started may have a session bb had not named yet.
     if (harnessOf(thread.providerId).reader !== "events") {
-      facts.delete(thread.id);
+      outdate(thread.id);
+      remember(starts, thread.id, (starts.get(thread.id) ?? 0) + 1);
       retryAttempts.delete(thread.id);
+      // A report held from before the start would hide the new session until it expired.
+      invalidate(thread.id);
     }
     heardStatus(thread);
   });
@@ -562,7 +599,7 @@ export function createReportSource(
         retryTimers.delete(threadId);
       }
       retryAttempts.delete(threadId);
-      for (const map of [facts, statuses, heardAt, reports, versions, saved, reading, looking]) map.delete(threadId);
+      for (const map of [facts, statuses, heardAt, reports, versions, saved, reading, looking, starts]) map.delete(threadId);
       await events.forget(threadId);
     },
     dispose() {

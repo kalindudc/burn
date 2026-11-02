@@ -4,6 +4,14 @@ import type { rpcContract, UsageAnswer } from "./contract.js";
 
 export const errorText = (cause: unknown): string => (cause instanceof Error ? cause.message : String(cause));
 
+/**
+ * How long a read may go unanswered before it stops holding back the next one. bb's fetch has no
+ * deadline, so a lost answer would otherwise leave every later signal waiting on it.
+ */
+export const READ_TIMEOUT_MS = 30_000;
+/** How often a working thread is read again with no signal, in case one was missed. */
+export const WORKING_REFETCH_MS = 60_000;
+
 /** schema.ts#THREAD_ID without importing zod into the app bundle. */
 export const isThreadId = (id: string): boolean => /^thr_[0-9a-z]{6,40}$/.test(id);
 
@@ -26,7 +34,8 @@ export function useOnReconnect(onChange: () => void): void {
 
 /**
  * The thread's usage, refetched on its own `usage` signal (and its children's
- * when `withChildren`) and after a reconnect; at list price when `listPrice`.
+ * when `withChildren`), after a reconnect and every minute while the thread
+ * works; at list price when `listPrice`.
  */
 export function useUsage(
   threadId: string,
@@ -57,10 +66,16 @@ export function useUsage(
     const flight = { again: false };
     flights.current.set(key, flight);
     const asked = ++latest.current;
+    let finished = false;
+    // Runs once, when the read settles or times out; a late answer still counts if nothing newer was asked.
     const done = (): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
       flights.current.delete(key);
       if (flight.again && mounted.current && current.current === key) run();
     };
+    const timer = setTimeout(done, READ_TIMEOUT_MS);
     rpc.call("usage", listPrice ? { threadId, listPrice: true } : { threadId }).then(
       (next) => {
         if (asked === latest.current) {
@@ -81,14 +96,15 @@ export function useUsage(
     setHeld(null);
     refetch();
   }, [refetch]);
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    // Set here as well as in useRef: React's development remount runs this again after the cleanup.
+    mounted.current = true;
+    return () => {
       mounted.current = false;
       latest.current++;
       flights.current.clear();
-    },
-    [],
-  );
+    };
+  }, []);
   const withChildren = opts.withChildren === true;
   useRealtime(
     "usage",
@@ -101,7 +117,14 @@ export function useUsage(
     ),
   );
   useOnReconnect(refetch);
-  return { answer: held?.key === key ? held.answer : null, error, refetch };
+  const answer = held?.key === key ? held.answer : null;
+  const working = answer?.report?.running === true;
+  useEffect(() => {
+    if (!working) return;
+    const timer = setInterval(refetch, WORKING_REFETCH_MS);
+    return () => clearInterval(timer);
+  }, [working, refetch]);
+  return { answer, error, refetch };
 }
 
 /** Date.now(), refreshed every `everyMs` while mounted. */

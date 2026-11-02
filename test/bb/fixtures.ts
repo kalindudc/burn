@@ -65,14 +65,16 @@ export const identityEvent = (threadId: string, providerThreadId: string) => eve
 
 type ListArgs = { threadId: string; types?: readonly string[]; afterSeq?: string; order?: "asc" | "desc"; limit?: string };
 
-/** bb's `threads.events.list` over `rows()`: one thread's rows of the types asked for, after a seq, oldest first, one page. */
+/** bb's `threads.events.list` over `rows()`: one thread's rows of the types asked for, after a seq, oldest first, one page of 100 unless asked for fewer. */
 export const listEvents =
   (rows: () => readonly EventRow[]) =>
-  async ({ threadId, types, afterSeq, limit }: ListArgs): Promise<EventRow[]> =>
-    rows()
+  async ({ threadId, types, afterSeq, limit = "100" }: ListArgs): Promise<EventRow[]> => {
+    if (Number(limit) > 100) throw new Error("Thread event limit cannot exceed 100");
+    return rows()
       .filter((r) => r.threadId === threadId && (types === undefined || types.includes(r.type)) && (afterSeq === undefined || r.seq > Number(afterSeq)))
       .sort((a, b) => a.seq - b.seq)
-      .slice(0, limit === undefined ? undefined : Number(limit));
+      .slice(0, Number(limit));
+  };
 
 // One Codex session: two responses, with cached tokens inside inputTokens as Codex counts them.
 export const CODEX_1 = totals({

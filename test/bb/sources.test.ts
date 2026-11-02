@@ -24,7 +24,7 @@ const A = "host_a";
 const B = "host_b";
 const costOf = (total: number) => sampleReport({ cost: { input: total, output: 0, cacheRead: 0, cacheWrite: 0, total } });
 
-type Thread = { host: string | null; provider?: string; status?: "active" | "idle" | "error"; sessions?: string[] };
+type Thread = { host: string | null; provider?: string; status?: "active" | "idle" | "error"; sessions?: string[]; source?: string };
 
 /** A source over fake threads; each host answers with `costs[threadId]`, or throws when listed in `offline`. */
 function setup(threads: Record<string, Thread>, opts: { offline?: string[]; directory?: boolean; coverageNote?: string; retryMs?: number; retryMax?: number } = {}) {
@@ -34,6 +34,8 @@ function setup(threads: Record<string, Thread>, opts: { offline?: string[]; dire
   const offline = new Set(opts.offline ?? []);
   let gate: Promise<void> | null = null;
   let getGate: Promise<void> | null = null;
+  // Runs after bb has worked out a page of identities and before it answers, as a slow connection would.
+  let identityHook: (() => Promise<void>) | null = null;
   let now = 1_000_000;
   const { bb, harness } = createFakePluginHost({
     pluginId: "burn",
@@ -65,18 +67,20 @@ function setup(threads: Record<string, Thread>, opts: { offline?: string[]; dire
             providerId: t.provider ?? "pi",
             environmentId: t.host ? `env_${t.host}` : null,
             status: t.status ?? "idle",
+            ...(t.source ? { sourceThreadId: t.source } : {}),
           });
         },
         events: {
-          list: async (args: Parameters<ReturnType<typeof listEvents>>[0]) =>
-            args.types?.includes("thread/identity")
-              ? (threads[args.threadId]?.sessions ?? [`pi_${args.threadId}`]).map((providerThreadId, seq) => ({
-                  type: "thread/identity",
-                  threadId: args.threadId,
-                  seq,
-                  data: { providerThreadId },
-                }))
-              : listEvents(() => rows)(args),
+          list: async (args: Parameters<ReturnType<typeof listEvents>>[0]) => {
+            if (!args.types?.includes("thread/identity")) return listEvents(() => rows)(args);
+            // One identity event per entry of `sessions`, paged as bb pages them.
+            const identities = (threads[args.threadId]?.sessions ?? [`pi_${args.threadId}`]).map(
+              (providerThreadId, n) => ({ type: "thread/identity", threadId: args.threadId, seq: n + 1, data: { providerThreadId } }) as unknown as EventRow,
+            );
+            const page = await listEvents(() => identities)(args);
+            if (identityHook) await identityHook();
+            return page;
+          },
         },
       },
       environments: { get: async ({ environmentId }: { environmentId: string }) => ({ id: environmentId, hostId: environmentId.slice(4) }) },
@@ -126,6 +130,21 @@ function setup(threads: Record<string, Thread>, opts: { offline?: string[]; dire
     });
     return release;
   };
+  /** Holds the identity answers bb has already worked out, as a slow connection would. */
+  const holdIdentities = (): (() => void) => {
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = () => {
+        identityHook = null;
+        resolve();
+      };
+    });
+    identityHook = () => gate;
+    return release;
+  };
+  const onIdentities = (hook: (() => Promise<void>) | null): void => {
+    identityHook = hook;
+  };
   const holdLookups = (): (() => void) => {
     let release = (): void => undefined;
     getGate = new Promise((resolve) => {
@@ -136,7 +155,7 @@ function setup(threads: Record<string, Thread>, opts: { offline?: string[]; dire
     });
     return release;
   };
-  return { bb, harness, source, costs, rows, calls, asked, cost, changed, offline, hold, holdLookups, tick: (ms: number) => (now += ms) };
+  return { bb, harness, source, costs, rows, calls, asked, cost, changed, offline, hold, holdLookups, holdIdentities, onIdentities, tick: (ms: number) => (now += ms) };
 }
 
 describe("createReportSource", () => {
@@ -549,6 +568,100 @@ describe("createReportSource", () => {
     await s.source.forget(id(1));
     await s.source.reportsOf([id(1)]);
     expect(s.harness.inspection.sdk.callsTo("threads.events.list")).toHaveLength(3);
+  });
+
+  it("reads every page of a thread's session identities, so a thread resumed many times still finds its newest session", async () => {
+    const t = id(1);
+    const s = setup({ [t]: { host: A, sessions: [...Array(110).fill("pi_old"), ...Array(10).fill("pi_new")] } });
+    s.costs[t] = 1;
+    await s.source.reportsOf([t]);
+    expect((s.calls[0]?.input as { threads: { sessionIds: string[] }[] }).threads[0]?.sessionIds).toEqual(["pi_old", "pi_new", t]);
+    expect(s.harness.inspection.sdk.callsTo("threads.events.list")).toHaveLength(2);
+  });
+
+  it("reads a thread again as soon as it starts, instead of serving the report it held from before", async () => {
+    const t = id(1);
+    const s = setup({ [t]: { host: A } });
+    s.costs[t] = 1;
+    expect(await s.cost(t)).toEqual([1]);
+    s.costs[t] = 2;
+    await s.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: t, providerId: "pi", status: "active" }) });
+    expect(await s.cost(t)).toEqual([2]);
+  });
+
+  it("still matches a thread's log changes after it starts, before it is looked up again", async () => {
+    const t = id(1);
+    const s = setup({ [t]: { host: A } });
+    s.costs[t] = 1;
+    await s.source.reportsOf([t]);
+    await s.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: t, providerId: "pi", status: "active" }) });
+    expect(s.changed).toEqual([[t]]);
+    await s.harness.behavior.experimental_emitHostSignal(A, "changed", { sessionIds: [`pi_${t}`], all: false });
+    expect(s.changed).toEqual([[t], [t]]);
+  });
+
+  it("looks again when a thread starts while its lookup is under way, so the new session is not missed", async () => {
+    const t = id(1);
+    const threads: Record<string, Thread> = { [t]: { host: A, sessions: ["pi_one"] } };
+    const s = setup(threads);
+    s.costs[t] = 1;
+    const release = s.holdIdentities();
+    const asking = s.source.reportsOf([t]);
+    await vi.waitFor(() => expect(s.harness.inspection.sdk.callsTo("threads.events.list")).toHaveLength(1));
+    threads[t] = { host: A, sessions: ["pi_one", "pi_two"] };
+    await s.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: t, providerId: "pi", status: "active" }) });
+    release();
+    await asking;
+    const sent = s.calls.map((c) => (c.input as { threads: { sessionIds: string[] }[] }).threads[0]?.sessionIds);
+    expect(sent).toEqual([["pi_one", "pi_two", t]]);
+    await s.harness.behavior.experimental_emitHostSignal(A, "changed", { sessionIds: ["pi_two"], all: false });
+    expect(s.changed.at(-1)).toEqual([t]);
+  });
+
+  it("looks a thread up again on its next read when it started again during every try of a lookup", async () => {
+    const t = id(1);
+    const threads: Record<string, Thread> = { [t]: { host: A, sessions: ["pi_0"] } };
+    const s = setup(threads);
+    s.costs[t] = 1;
+    let started = 0;
+    // Each time bb answers, the thread starts again with a session that answer did not have.
+    s.onIdentities(async () => {
+      if (started >= 3) return;
+      started++;
+      threads[t] = { host: A, sessions: [...threads[t]!.sessions!, `pi_${started}`] };
+      await s.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: t, providerId: "pi", status: "active" }) });
+    });
+    await s.source.reportsOf([t]);
+    expect(s.harness.inspection.sdk.callsTo("threads.events.list")).toHaveLength(3);
+    s.tick(60_000);
+    await s.source.reportsOf([t]);
+    const sent = s.calls.map((c) => (c.input as { threads: { sessionIds: string[] }[] }).threads[0]?.sessionIds);
+    expect(sent.at(-1)).toEqual(["pi_0", "pi_1", "pi_2", "pi_3", t]);
+  });
+
+  it("still matches a working thread's log changes once its provisional lookup is due again", async () => {
+    const t = id(1);
+    const s = setup({ [t]: { host: A, status: "active", sessions: [] } }, { retryMs: 10 });
+    s.costs[t] = 1;
+    await s.source.reportsOf([t]);
+    await vi.waitFor(() => expect(s.changed.flat()).toContain(t));
+    const before = s.changed.length;
+    await s.harness.behavior.experimental_emitHostSignal(A, "changed", { sessionIds: [t], all: false });
+    expect(s.changed).toHaveLength(before + 1);
+    expect(s.changed.at(-1)).toEqual([t]);
+  });
+
+  it("reads every page of a Claude Code fork's parent sessions", async () => {
+    const fork = id(1);
+    const parent = id(2);
+    const s = setup({
+      [fork]: { host: A, provider: "claude-code", sessions: ["c_fork"], source: parent },
+      [parent]: { host: A, provider: "claude-code", sessions: [...Array(110).fill("c_old"), "c_new"] },
+    });
+    s.costs[fork] = 1;
+    await s.source.reportsOf([fork]);
+    expect(s.calls[0]?.input).toMatchObject({ harness: "claude", threads: [{ threadId: fork, parentSessionIds: ["c_old", "c_new"] }] });
+    await s.harness.lifecycle.dispose();
   });
 });
 

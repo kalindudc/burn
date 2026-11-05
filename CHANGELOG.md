@@ -4,6 +4,13 @@ Notable changes to Burn, newest first.
 
 Burn follows [semantic versioning](https://semver.org). Releases from 0.4.0 on are tagged `vX.Y.Z` in this repository; earlier versions were not tagged. Each release's commit message has the full detail, including how the release was checked.
 
+## Unreleased
+
+- **A thread on a machine that bb creates for it shows its cost from its first turn.** bb links a thread to a machine it creates for that thread only once the machine is ready, and Burn's shared list of threads can be up to a minute older than that. Burn read such a thread as having no machine and kept that answer for five minutes, so a thread showed nothing until its next turn started. Burn now reads a working thread that has no machine in that list straight from bb. If bb has not given it a machine yet, Burn looks again after 5, 10 and 20 seconds, then every 30 seconds, for about three minutes, and only while the thread is working.
+- **The wait for a machine stays cheap.** Each look reads only that thread, and its environment once it has one, never the whole list of threads. At most four looks run at once. A look bb does not answer within 25 seconds gives up its place, but no more than eight reads ever wait on bb together. A look that fails counts as one that found no machine rather than starting the wait again, and the chip reads again only when a look finds the machine. A thread bb has soft-deleted stops the wait.
+- **A lookup that finishes after its thread is deleted, or after the plugin unloads, leaves nothing behind.** It used to keep its answer: it could mark the deleted thread as working again, schedule another retry, ask the thread's machine for its figures, or tell the page to fill it in. Now it keeps nothing, schedules nothing, asks no machine and signals nothing, and so does a page read that was waiting on it.
+- **A thread whose lookups keep failing stops asking the chip to reread.** A failed lookup of a working thread retried every five seconds and asked the chip to read again each time, with no limit, because each failure reset the retry count. Failures now count toward the same limit of 12 as a thread whose session bb has not named yet.
+
 ## 0.9.3 - 2026-11-02
 
 The chip no longer greys out while a thread works, and it stops waiting on reads that never come back. A thread whose agent restarted many times finds its newest session again, and a thread that starts a turn shows its new figures at once.

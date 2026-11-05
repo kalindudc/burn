@@ -15,6 +15,15 @@ const FACTS_TTL_MS = 5 * 60_000;
 const FACTS_RETRY_MS = 5_000;
 /** Consecutive retries before a thread with no session identity settles on the normal facts TTL. */
 const FACTS_RETRY_MAX = 12;
+/**
+ * When a working thread that bb has not given a machine yet is looked up again, about three minutes in all.
+ * Each look reads that thread, and its environment once it has one; only a look that finds the machine tells the UI.
+ */
+const HOST_WAIT_STEPS_MS = [5_000, 10_000, 20_000, 30_000, 30_000, 30_000, 30_000, 30_000];
+/** How many of those looks run at once, so many threads waiting together do not crowd bb. */
+const HOST_WAIT_CONCURRENCY = 4;
+/** How many may wait on bb at once, counting looks that gave up their slot to a bb that does not answer. */
+const HOST_WAIT_PENDING_MAX = 2 * HOST_WAIT_CONCURRENCY;
 const REPORT_TTL_MS = 60_000;
 /** How many threads are looked up at once: enough to use a fast bb, few enough not to swamp it. */
 const FACTS_CONCURRENCY = 32;
@@ -76,6 +85,8 @@ interface Facts {
   stems: Set<string>;
   /** The lookup found no session id of its own, only the thread-id fallback, so it is worth repeating soon. */
   retry?: boolean;
+  /** bb says the thread is working, but has not given it a machine yet. */
+  awaitingHost?: boolean;
   /** A thread event made these out of date: they still match log changes, but the next read looks the thread up again. */
   outdated?: boolean;
 }
@@ -124,11 +135,20 @@ async function eachLimit<T>(items: readonly T[], limit: number, fn: (item: T) =>
  */
 export function createReportSource(
   bb: BbPluginApi,
-  opts: { onChange(threadIds: string[]): void; now?: () => number; threads?: ThreadDirectory; overrides?: () => PriceOverrides; retryMs?: number; retryMax?: number },
+  opts: {
+    onChange(threadIds: string[]): void;
+    now?: () => number;
+    threads?: ThreadDirectory;
+    overrides?: () => PriceOverrides;
+    retryMs?: number;
+    retryMax?: number;
+    hostWaitStepsMs?: readonly number[];
+  },
 ): ReportSource {
   const now = opts.now ?? Date.now;
   const retryMs = opts.retryMs ?? FACTS_RETRY_MS;
   const retryMax = opts.retryMax ?? FACTS_RETRY_MAX;
+  const hostWaitSteps = opts.hostWaitStepsMs ?? HOST_WAIT_STEPS_MS;
   const host = bb.hosts.experimental_client({ contract: hostContract, experimental_signals: hostSignals });
   const events = createEventReader(bb, { onChange: opts.onChange, now, overrides: opts.overrides });
   const facts = new Map<string, Facts>();
@@ -138,6 +158,15 @@ export function createReportSource(
   const reports = new Map<string, { got: LogReport | null; checkedAt: number }>();
   const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const retryAttempts = new Map<string, number>();
+  const hostTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const hostSteps = new Map<string, number>();
+  // Looks for a machine that are due, run HOST_WAIT_CONCURRENCY at a time.
+  const hostQueue = new Set<string>();
+  let hostLooks = 0;
+  let hostPending = 0;
+  // The lookup each thread's details may come from. forget drops it, so a lookup under way then keeps nothing.
+  const owners = new Map<string, object>();
+  let disposed = false;
   // Bumped by every change, so a read that raced the change is not kept as current.
   const versions = new Map<string, number>();
   const saved = new Map<string, number>();
@@ -178,8 +207,14 @@ export function createReportSource(
             since: row.sourceThreadId ? row.createdAt : undefined,
           };
     }
+    return fetched(threadId);
+  }
+
+  /** The thread row from bb itself, never from the shared listing; null for a deleted thread. */
+  async function fetched(threadId: string): Promise<Looked | null> {
     const listedAt = now();
     const thread = await bb.sdk.threads.get({ threadId });
+    if (thread.deletedAt !== null) return null;
     return {
       listedAt,
       status: thread.status,
@@ -192,21 +227,63 @@ export function createReportSource(
     };
   }
 
-  async function lookUp(threadId: string): Promise<Facts> {
+  /**
+   * `direct` reads the thread from bb rather than the shared listing, as a timed look for its machine does.
+   * `live` says whether the lookup still counts; forget and dispose end it.
+   */
+  async function lookUp(threadId: string, direct: boolean, live: () => boolean): Promise<Facts> {
     const asked = now();
-    const row = await lookup(threadId);
     const newer = (listedAt: number) => listedAt > (heardAt.get(threadId) ?? Number.NEGATIVE_INFINITY);
+    // A forgotten thread's late answer must not bring its status back.
+    const note = (listedAt: number, status: string): void => {
+      if (live() && newer(listedAt)) remember(statuses, threadId, status);
+    };
+    // While looking for a working thread's machine, a failed read counts as no machine yet, so the wait keeps to its
+    // schedule. Only these reads: a failure once the machine is known takes the session retry, which signals.
+    const stillWaiting = (providerId: string | null, err: unknown): Facts => {
+      bb.log.warn(`reading thread ${threadId} for its machine failed: ${message(err)}`);
+      return { at: now(), hostId: null, providerId, sessionIds: [], stems: new Set(), awaitingHost: statuses.get(threadId) === "active" };
+    };
+    let row: Looked | null;
+    try {
+      row = direct ? await fetched(threadId) : await lookup(threadId);
+    } catch (err) {
+      if (!direct) throw err;
+      return stillWaiting(facts.get(threadId)?.providerId ?? null, err);
+    }
     if (row === null) {
-      if (newer(asked)) remember(statuses, threadId, "deleted");
+      note(asked, "deleted");
       return { at: now(), hostId: null, providerId: null, sessionIds: [], stems: new Set() };
     }
-    if (newer(row.listedAt)) remember(statuses, threadId, row.status);
+    note(row.listedAt, row.status);
     const reader = harnessOf(row.providerId).reader;
-    if ((reader !== "pi-log" && reader !== "opencode-db" && reader !== "claude-log") || row.environmentId === null) {
+    if (reader !== "pi-log" && reader !== "opencode-db" && reader !== "claude-log") {
       return { at: now(), hostId: null, providerId: row.providerId, sessionIds: [], stems: new Set() };
     }
-    const hostId = row.hostKnown ? row.hostId : (await bb.sdk.environments.get({ environmentId: row.environmentId })).hostId;
-    if (hostId === null) return { at: now(), hostId: null, providerId: row.providerId, sessionIds: [], stems: new Set() };
+    const providerId = row.providerId;
+    // bb attaches an environment it creates for the thread only once it is ready, and the shared listing can be a
+    // minute older than that. A working thread has its machine by now, so read its own row instead.
+    const stale = row.hostKnown && (row.environmentId === null || row.hostId === null) && statuses.get(threadId) === "active";
+    let hostId: string | null;
+    try {
+      if (stale) {
+        const ownAsked = now();
+        const own = await fetched(threadId);
+        if (own === null) {
+          note(ownAsked, "deleted");
+          return { at: now(), hostId: null, providerId: null, sessionIds: [], stems: new Set() };
+        }
+        row = own;
+        note(row.listedAt, row.status);
+      }
+      hostId = row.environmentId === null ? null : row.hostKnown ? row.hostId : (await bb.sdk.environments.get({ environmentId: row.environmentId })).hostId;
+    } catch (err) {
+      if (!direct && !stale) throw err;
+      return stillWaiting(providerId, err);
+    }
+    if (hostId === null) {
+      return { at: now(), hostId: null, providerId: row.providerId, sessionIds: [], stems: new Set(), awaitingHost: statuses.get(threadId) === "active" };
+    }
     // The thread id too, for a session named after the thread rather than an identity.
     const sessionIds = [...new Set([...(await identitiesOf(threadId)), threadId])].slice(-SESSIONS_MAX);
     // Only pi's bridge names its session files after these ids.
@@ -278,25 +355,91 @@ export function createReportSource(
     retryTimers.set(threadId, timer);
   }
 
-  async function factsOf(threadId: string): Promise<Facts> {
+  /**
+   * A working thread with no machine yet is looked up again on HOST_WAIT_STEPS_MS. Unlike the session retry,
+   * a look that still finds no machine tells no one, so the wait costs no reread of the thread.
+   */
+  function awaitHost(threadId: string): void {
+    if (disposed || hostTimers.has(threadId) || hostQueue.has(threadId)) return;
+    const step = hostSteps.get(threadId) ?? 0;
+    const delay = hostWaitSteps[step];
+    if (delay === undefined) return;
+    hostSteps.set(threadId, step + 1);
+    const timer = setTimeout(() => {
+      hostTimers.delete(threadId);
+      hostQueue.add(threadId);
+      lookForHosts();
+    }, delay);
+    timer.unref?.();
+    hostTimers.set(threadId, timer);
+  }
+
+  function lookForHosts(): void {
+    while (!disposed && hostLooks < HOST_WAIT_CONCURRENCY && hostPending < HOST_WAIT_PENDING_MAX) {
+      const threadId = hostQueue.values().next().value;
+      if (threadId === undefined) return;
+      hostQueue.delete(threadId);
+      // Checked when the look starts rather than when it fell due, since it may have waited in the queue.
+      if (!facts.get(threadId)?.awaitingHost || statuses.get(threadId) !== "active") continue;
+      hostLooks++;
+      hostPending++;
+      outdate(threadId);
+      // A look bb does not answer gives up its slot after HOST_TIMEOUT_MS and finishes in the background,
+      // still counted in hostPending, since bb cannot cancel the read.
+      let freed = false;
+      const timer = setTimeout(() => free(), HOST_TIMEOUT_MS);
+      timer.unref?.();
+      const free = (): void => {
+        if (freed) return;
+        freed = true;
+        clearTimeout(timer);
+        hostLooks--;
+        lookForHosts();
+      };
+      factsOf(threadId, true)
+        .then(
+          (found) => {
+            if (found.hostId === null || disposed) return;
+            invalidate(threadId);
+            opts.onChange([threadId]);
+          },
+          (err: unknown) => bb.log.warn(`looking for the machine of ${threadId} failed: ${message(err)}`),
+        )
+        .finally(() => {
+          hostPending--;
+          if (freed) lookForHosts();
+          else free();
+        });
+    }
+  }
+
+  async function factsOf(threadId: string, direct = false): Promise<Facts> {
     const held = facts.get(threadId);
     if (held && !held.outdated && now() - held.at < (held.retry ? retryMs : FACTS_TTL_MS)) return held;
     const under = looking.get(threadId);
     if (under) return under;
+    const token = {};
+    owners.set(threadId, token);
+    const live = (): boolean => !disposed && owners.get(threadId) === token;
     const run = (async (): Promise<Facts> => {
       let found: Facts;
       let overtaken = false;
+      let failed = false;
       for (let tries = 1; ; tries++) {
         const started = starts.get(threadId) ?? 0;
         try {
-          found = await lookUp(threadId);
+          found = await lookUp(threadId, direct, live);
+          failed = false;
         } catch (err) {
+          failed = true;
           bb.log.warn(`looking up thread ${threadId} failed, so Burn reads no session log for it: ${message(err)}`);
           found = { at: now(), hostId: null, providerId: null, sessionIds: [], stems: new Set(), retry: true };
         }
         overtaken = (starts.get(threadId) ?? 0) !== started;
-        if (!overtaken || tries >= LOOKUP_TRIES) break;
+        if (!overtaken || tries >= LOOKUP_TRIES || !live()) break;
       }
+      // Ended by forget or dispose: keep nothing, schedule nothing, and give the callers no machine to ask.
+      if (!live()) return { at: now(), hostId: null, providerId: found.providerId, sessionIds: [], stems: new Set() };
       const provisional =
         found.providerId !== null &&
         harnessOf(found.providerId).reader === "pi-log" &&
@@ -304,9 +447,12 @@ export function createReportSource(
         found.sessionIds[0] === threadId;
       // A thread that started again during the last try may have a session this lookup missed; the next read looks again.
       found = { ...found, retry: found.retry === true || provisional, ...(overtaken ? { outdated: true } : {}) };
-      if (!provisional) retryAttempts.delete(threadId);
+      // A failed lookup keeps its count, so a thread whose lookups keep failing stops at the retry limit.
+      if (!provisional && !failed) retryAttempts.delete(threadId);
       remember(facts, threadId, found);
       if (found.retry && statuses.get(threadId) === "active") scheduleRetry(threadId);
+      if (found.awaitingHost) awaitHost(threadId);
+      else if (found.hostId !== null) hostSteps.delete(threadId);
       return found;
     })();
     looking.set(threadId, run);
@@ -314,6 +460,7 @@ export function createReportSource(
       return await run;
     } finally {
       if (looking.get(threadId) === run) looking.delete(threadId);
+      if (owners.get(threadId) === token) owners.delete(threadId);
     }
   }
 
@@ -446,6 +593,7 @@ export function createReportSource(
       outdate(thread.id);
       remember(starts, thread.id, (starts.get(thread.id) ?? 0) + 1);
       retryAttempts.delete(thread.id);
+      hostSteps.delete(thread.id);
       // A report held from before the start would hide the new session until it expired.
       invalidate(thread.id);
     }
@@ -543,7 +691,9 @@ export function createReportSource(
       if (!factsInTime) {
         factsRun.then(
           () => {
-            const late = stale.filter((threadId) => !ready.has(threadId));
+            if (disposed) return;
+            // A thread forgotten meanwhile has no details left, and nothing to fill in.
+            const late = stale.filter((threadId) => !ready.has(threadId) && facts.has(threadId));
             if (late.length > 0) opts.onChange(late);
           },
           (err: unknown) => bb.log.warn(`looking up the threads of ${ids.length} thread(s) failed: ${message(err)}`),
@@ -552,9 +702,10 @@ export function createReportSource(
       if (!inTime) {
         Promise.all([...own, ...joined.keys()]).then(
           () => {
+            if (disposed) return;
             const late = ids.filter((threadId) => {
               const got = latest(threadId);
-              return got != null && got.at !== out.get(threadId)?.at;
+              return got != null && got.at !== out.get(threadId)?.at && facts.has(threadId);
             });
             if (late.length > 0) opts.onChange(late);
           },
@@ -593,18 +744,26 @@ export function createReportSource(
       saved.clear();
     },
     async forget(threadId) {
-      const timer = retryTimers.get(threadId);
-      if (timer !== undefined) {
-        clearTimeout(timer);
-        retryTimers.delete(threadId);
+      for (const timers of [retryTimers, hostTimers]) {
+        const timer = timers.get(threadId);
+        if (timer !== undefined) {
+          clearTimeout(timer);
+          timers.delete(threadId);
+        }
       }
       retryAttempts.delete(threadId);
-      for (const map of [facts, statuses, heardAt, reports, versions, saved, reading, looking, starts]) map.delete(threadId);
+      hostSteps.delete(threadId);
+      hostQueue.delete(threadId);
+      for (const map of [facts, statuses, heardAt, reports, versions, saved, reading, looking, starts, owners]) map.delete(threadId);
       await events.forget(threadId);
     },
     dispose() {
-      for (const timer of retryTimers.values()) clearTimeout(timer);
-      retryTimers.clear();
+      disposed = true;
+      hostQueue.clear();
+      for (const timers of [retryTimers, hostTimers]) {
+        for (const timer of timers.values()) clearTimeout(timer);
+        timers.clear();
+      }
     },
   };
 }

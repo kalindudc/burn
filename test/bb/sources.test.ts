@@ -16,6 +16,7 @@ import { CODEX_1, CODEX_1_2, CODEX_2, listEvents, requestEvent, usageEvent } fro
 
 const dirs: string[] = [];
 afterEach(() => {
+  vi.useRealTimers();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -24,16 +25,21 @@ const A = "host_a";
 const B = "host_b";
 const costOf = (total: number) => sampleReport({ cost: { input: total, output: 0, cacheRead: 0, cacheWrite: 0, total } });
 
-type Thread = { host: string | null; provider?: string; status?: "active" | "idle" | "error"; sessions?: string[]; source?: string };
+/** `host: null` is a thread with no environment, as a new one is until bb has created its machine. */
+type Thread = { host: string | null; provider?: string; status?: "active" | "idle" | "error" | "starting"; sessions?: string[]; source?: string; deleted?: boolean };
 
 /** A source over fake threads; each host answers with `costs[threadId]`, or throws when listed in `offline`. */
-function setup(threads: Record<string, Thread>, opts: { offline?: string[]; directory?: boolean; coverageNote?: string; retryMs?: number; retryMax?: number } = {}) {
+function setup(
+  threads: Record<string, Thread>,
+  opts: { offline?: string[]; directory?: boolean; coverageNote?: string; retryMs?: number; retryMax?: number; hostWaitStepsMs?: number[] } = {},
+) {
   const costs: Record<string, number> = {};
   const rows: EventRow[] = [];
   const calls: ExperimentalFakeHostRpcCall[] = [];
   const offline = new Set(opts.offline ?? []);
   let gate: Promise<void> | null = null;
   let getGate: Promise<void> | null = null;
+  let getFails = false;
   // Runs after bb has worked out a page of identities and before it answers, as a slow connection would.
   let identityHook: (() => Promise<void>) | null = null;
   let now = 1_000_000;
@@ -59,10 +65,13 @@ function setup(threads: Record<string, Thread>, opts: { offline?: string[]; dire
             }))
             .slice(offset, limit === undefined ? undefined : offset + limit),
         get: async ({ threadId }: { threadId: string }) => {
-          const t = threads[threadId];
           if (getGate) await getGate;
+          // Read once bb answers, so a test can change the thread while a read is held.
+          const t = threads[threadId];
+          if (getFails) throw new Error("bb is unreachable");
           if (!t) throw new Error(`no thread ${threadId}`);
           return makeThreadResponse({
+            ...(t.deleted ? { deletedAt: 1 } : {}),
             id: threadId,
             providerId: t.provider ?? "pi",
             environmentId: t.host ? `env_${t.host}` : null,
@@ -111,6 +120,7 @@ function setup(threads: Record<string, Thread>, opts: { offline?: string[]; dire
     ...(opts.directory ? { threads: createThreadDirectory(bb, { now: () => now }) } : {}),
     ...(opts.retryMs === undefined ? {} : { retryMs: opts.retryMs }),
     ...(opts.retryMax === undefined ? {} : { retryMax: opts.retryMax }),
+    ...(opts.hostWaitStepsMs === undefined ? {} : { hostWaitStepsMs: opts.hostWaitStepsMs }),
   });
   const asked = (hostId?: string) =>
     calls
@@ -155,7 +165,10 @@ function setup(threads: Record<string, Thread>, opts: { offline?: string[]; dire
     });
     return release;
   };
-  return { bb, harness, source, costs, rows, calls, asked, cost, changed, offline, hold, holdLookups, holdIdentities, onIdentities, tick: (ms: number) => (now += ms) };
+  const failLookups = (on: boolean): void => {
+    getFails = on;
+  };
+  return { bb, harness, source, costs, rows, calls, asked, cost, changed, offline, hold, holdLookups, failLookups, holdIdentities, onIdentities, tick: (ms: number) => (now += ms) };
 }
 
 describe("createReportSource", () => {
@@ -649,6 +662,247 @@ describe("createReportSource", () => {
     await s.harness.behavior.experimental_emitHostSignal(A, "changed", { sessionIds: [t], all: false });
     expect(s.changed).toHaveLength(before + 1);
     expect(s.changed.at(-1)).toEqual([t]);
+  });
+
+  it("finds the machine of a thread that starts once bb attaches its new environment, though the shared listing is from before", async () => {
+    const t = id(1);
+    const threads: Record<string, Thread> = { [t]: { host: null, status: "starting" } };
+    const s = setup(threads, { directory: true });
+    s.costs[t] = 1;
+    const lookups = () => s.harness.inspection.sdk.callsTo("threads.get").length + s.harness.inspection.sdk.callsTo("environments.get").length;
+    // While bb is still creating the machine there is nothing to ask, and Burn makes no call of its own to find it.
+    expect(await s.cost(t)).toEqual([null]);
+    expect(lookups()).toBe(0);
+    threads[t] = { host: A, status: "active" };
+    await s.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: t, providerId: "pi", status: "active" }) });
+    expect(await s.cost(t)).toEqual([1]);
+    expect(s.asked(A)).toEqual([[t]]);
+    // One read of this thread and its environment, not a new listing of every thread.
+    expect(s.harness.inspection.sdk.callsTo("threads.list")).toHaveLength(1);
+    expect(lookups()).toBe(2);
+  });
+
+  it("looks again for a working thread's machine on a growing schedule, and tells the UI only once it appears", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const t = id(1);
+    const threads: Record<string, Thread> = { [t]: { host: null, status: "active" } };
+    const s = setup(threads, { directory: true, hostWaitStepsMs: [5, 10, 20] });
+    s.costs[t] = 1;
+    const reads = () => s.harness.inspection.sdk.callsTo("threads.get").length;
+    expect(await s.cost(t)).toEqual([null]);
+    expect(reads()).toBe(1);
+    // The shared listing has expired; a timed look reads only this thread, never every thread again.
+    s.tick(61_000);
+    await vi.advanceTimersByTimeAsync(4);
+    expect(reads()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(reads()).toBe(2);
+    await vi.advanceTimersByTimeAsync(9);
+    expect(reads()).toBe(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(reads()).toBe(3);
+    // A look that finds no machine is one read of the thread: nothing signalled, no host asked, no new listing.
+    expect(s.changed).toEqual([]);
+    expect(s.calls).toHaveLength(0);
+    expect(s.harness.inspection.sdk.callsTo("threads.list")).toHaveLength(1);
+    threads[t] = { host: A, status: "active" };
+    await vi.advanceTimersByTimeAsync(20);
+    expect(reads()).toBe(4);
+    expect(s.changed).toEqual([[t]]);
+    expect(await s.cost(t)).toEqual([1]);
+    expect(s.asked(A)).toEqual([[t]]);
+  });
+
+  it("stops looking for a machine at the end of its schedule, and never looks for an idle thread's", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const working = id(1);
+    const idle = id(2);
+    const s = setup({ [working]: { host: null, status: "active" }, [idle]: { host: null, status: "idle" } }, { directory: true, hostWaitStepsMs: [5, 10] });
+    await s.source.reportsOf([working, idle]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const looked = s.harness.inspection.sdk.callsTo("threads.get").map(([args]) => (args as { threadId: string }).threadId);
+    expect(looked).toEqual([working, working, working]);
+    expect(s.changed).toEqual([]);
+  });
+
+  it("stops looking for a machine once the thread stops working", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const t = id(1);
+    const s = setup({ [t]: { host: null, status: "active" } }, { directory: true, hostWaitStepsMs: [5, 10, 20] });
+    await s.source.reportsOf([t]);
+    await vi.advanceTimersByTimeAsync(5);
+    expect(s.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(2);
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: t, providerId: "pi", status: "idle" }), lastAssistantText: null });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(2);
+  });
+
+  it("counts a failed first read of a working thread's own row as no machine yet, so the wait stays quiet", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const t = id(1);
+    const s = setup({ [t]: { host: null, status: "active" } }, { directory: true, hostWaitStepsMs: [5, 10, 20] });
+    s.failLookups(true);
+    await s.source.reportsOf([t]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(4);
+    expect(s.changed).toEqual([]);
+  });
+
+  it("keeps the schedule's budget when looks for a machine fail, rather than starting it again", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const t = id(1);
+    const s = setup({ [t]: { host: null, status: "active" } }, { directory: true, hostWaitStepsMs: [5, 10, 20] });
+    await s.source.reportsOf([t]);
+    s.failLookups(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(4);
+    expect(s.changed).toEqual([]);
+  });
+
+  it("stops signalling a working thread whose lookups keep failing after the retry limit", async () => {
+    const t = id(1);
+    const s = setup({ [t]: { host: A, status: "active" } }, { retryMs: 5, retryMax: 2 });
+    s.failLookups(true);
+    await s.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: t, providerId: "pi", status: "active" }) });
+    for (let i = 0; i < 5; i++) {
+      await s.source.reportsOf([t]);
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+    // One signal for the start, then one per retry up to the limit.
+    expect(s.changed.flat().filter((changed) => changed === t)).toHaveLength(3);
+  });
+
+  it("looks for at most four threads' machines at once", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const threads: Record<string, Thread> = {};
+    for (let n = 0; n < 10; n++) threads[id(n)] = { host: null, status: "active" };
+    const s = setup(threads, { directory: true, hostWaitStepsMs: [5] });
+    const reads = () => s.harness.inspection.sdk.callsTo("threads.get").length;
+    await s.source.reportsOf(Object.keys(threads));
+    expect(reads()).toBe(10);
+    const release = s.holdLookups();
+    await vi.advanceTimersByTimeAsync(5);
+    expect(reads()).toBe(14);
+    release();
+    await vi.waitFor(() => expect(reads()).toBe(20));
+  });
+
+  it("keeps nothing from a look that finishes after its thread is forgotten", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const gone = id(1);
+    const kept = id(2);
+    const threads: Record<string, Thread> = { [gone]: { host: null, status: "active" }, [kept]: { host: null, status: "active" } };
+    const s = setup(threads, { directory: true, hostWaitStepsMs: [5, 10, 20] });
+    const readsOf = (threadId: string) =>
+      s.harness.inspection.sdk.callsTo("threads.get").filter(([args]) => (args as { threadId: string }).threadId === threadId).length;
+    await s.source.reportsOf([gone, kept]);
+    const release = s.holdLookups();
+    await vi.advanceTimersByTimeAsync(5);
+    await s.source.forget(gone);
+    // bb still answers "active", and with a machine: the forgotten thread's late answer is dropped all the same.
+    threads[gone] = { host: A, status: "active" };
+    release();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(readsOf(gone)).toBe(2);
+    expect(readsOf(kept)).toBe(4);
+    expect(s.changed).toEqual([]);
+    expect(s.calls).toHaveLength(0);
+    expect(await s.source.running(gone)).toBe(false);
+  });
+
+  it("neither asks a host nor signals for a reader that joined a look whose thread was then forgotten", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const t = id(1);
+    const threads: Record<string, Thread> = { [t]: { host: null, status: "active" } };
+    const s = setup(threads, { directory: true, hostWaitStepsMs: [5, 10, 20] });
+    s.costs[t] = 1;
+    await s.source.reportsOf([t]);
+    const release = s.holdLookups();
+    await vi.advanceTimersByTimeAsync(5);
+    const waiting = s.source.reportsOf([t]);
+    const hurried = s.source.reportsOf([t], { deadlineMs: 10 });
+    await vi.advanceTimersByTimeAsync(10);
+    await hurried;
+    await s.source.forget(t);
+    threads[t] = { host: A, status: "active" };
+    release();
+    expect((await waiting).size).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.calls).toHaveLength(0);
+    expect(s.changed).toEqual([]);
+  });
+
+  it("frees a timed look's slot when bb does not answer, but never has more than eight reads waiting on bb", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const threads: Record<string, Thread> = {};
+    for (let n = 0; n < 20; n++) threads[id(n)] = { host: null, status: "active" };
+    const s = setup(threads, { directory: true, hostWaitStepsMs: [5] });
+    const reads = () => s.harness.inspection.sdk.callsTo("threads.get").length;
+    await s.source.reportsOf(Object.keys(threads));
+    expect(reads()).toBe(20);
+    const release = s.holdLookups();
+    await vi.advanceTimersByTimeAsync(5);
+    expect(reads()).toBe(24);
+    // Four reads bb has not answered give up their slots, so four other threads' looks still run.
+    await vi.advanceTimersByTimeAsync(25_000);
+    expect(reads()).toBe(28);
+    // With eight unanswered, nothing more starts however long bb takes.
+    await vi.advanceTimersByTimeAsync(10 * 25_000);
+    expect(reads()).toBe(28);
+    release();
+    await vi.waitFor(() => expect(reads()).toBe(40));
+  });
+
+  it("shows a thread's cost again soon when reading its sessions fails once after its machine is found", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const t = id(1);
+    const threads: Record<string, Thread> = { [t]: { host: null, status: "active" } };
+    const s = setup(threads, { directory: true, hostWaitStepsMs: [5] });
+    s.costs[t] = 1;
+    await s.source.reportsOf([t]);
+    await vi.advanceTimersByTimeAsync(5);
+    // The wait has used its one look; the machine arrives later and the details expire.
+    threads[t] = { host: A, status: "active" };
+    s.tick(5 * 60_000);
+    let failOnce = true;
+    s.onIdentities(async () => {
+      if (!failOnce) return;
+      failOnce = false;
+      throw new Error("bb is unreachable");
+    });
+    expect(await s.cost(t)).toEqual([null]);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(s.changed).toEqual([[t]]);
+    expect(await s.cost(t)).toEqual([1]);
+  });
+
+  it("schedules and signals nothing after it is disposed, though a look was under way", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const t = id(1);
+    const threads: Record<string, Thread> = { [t]: { host: null, status: "active" } };
+    const s = setup(threads, { directory: true, hostWaitStepsMs: [5, 10, 20] });
+    await s.source.reportsOf([t]);
+    const release = s.holdLookups();
+    await vi.advanceTimersByTimeAsync(5);
+    s.source.dispose();
+    threads[t] = { host: A, status: "active" };
+    release();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(2);
+    expect(s.changed).toEqual([]);
+    expect(s.calls).toHaveLength(0);
+  });
+
+  it("stops looking for the machine of a thread bb has deleted", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const t = id(1);
+    const threads: Record<string, Thread> = { [t]: { host: null, status: "active" } };
+    const s = setup(threads, { directory: true, hostWaitStepsMs: [5, 10, 20] });
+    await s.source.reportsOf([t]);
+    threads[t] = { host: null, status: "active", deleted: true };
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(2);
+    expect(await s.source.running(t)).toBe(false);
   });
 
   it("reads every page of a Claude Code fork's parent sessions", async () => {

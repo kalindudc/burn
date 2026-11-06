@@ -246,4 +246,129 @@ describe("createOpencodeDb", () => {
     expect(await createOpencodeDb(files).reportOf(["ses_missing"], "UTC")).toBeNull();
     expect(await createOpencodeDb({ path: join(files.dir, "missing.db"), modelsPath: files.modelsPath }).reportOf(["ses_1"], "UTC")).toBeNull();
   });
+
+  describe("opencode 2's session_message table", () => {
+    interface Row {
+      id: string;
+      session: string;
+      type: string;
+      data: Record<string, unknown> | string;
+    }
+
+    /** An opencode 2 database; row shapes come from opencode 2.2.4. `legacy` adds the older tables with one message. */
+    function setupV2(rows: Row[], sessions: { id: string; parent?: string }[] = [], legacy = false) {
+      const dir = mkdtempSync(join(tmpdir(), "burn-opencode-"));
+      dirs.push(dir);
+      const db = new DatabaseSync(join(dir, "opencode.db"));
+      db.exec(`
+        create table session_message (id text primary key, session_id text not null, type text not null, seq integer not null, time_created integer not null, time_updated integer not null, data text not null);
+        create table session_v2 (id text primary key, parent_id text);
+      `);
+      const session = db.prepare("insert into session_v2 (id, parent_id) values (?, ?)");
+      for (const s of sessions) session.run(s.id, s.parent ?? null);
+      const insert = db.prepare("insert into session_message (id, session_id, type, seq, time_created, time_updated, data) values (?, ?, ?, ?, ?, ?, ?)");
+      rows.forEach((row, seq) => insert.run(row.id, row.session, row.type, seq, AT + seq, AT + seq, typeof row.data === "string" ? row.data : JSON.stringify(row.data)));
+      if (legacy) {
+        db.exec(`
+          create table message (id text primary key, session_id text not null, time_created integer not null, time_updated integer not null, data text not null);
+          create table part (id text primary key, message_id text not null, session_id text not null, time_created integer not null, time_updated integer not null, data text not null);
+          create table session (id text primary key, parent_id text);
+        `);
+        db.prepare("insert into message (id, session_id, time_created, time_updated, data) values (?, ?, ?, ?, ?)").run(
+          "old",
+          "ses_old",
+          AT,
+          AT,
+          JSON.stringify({ role: "assistant", providerID: "p", modelID: "legacy-model", time: { created: AT }, cost: 0.5, tokens: { input: 7, output: 3, reasoning: 0, cache: { read: 0, write: 0 } } }),
+        );
+      }
+      db.close();
+      return createOpencodeDb({ path: join(dir, "opencode.db"), modelsPath: join(dir, "none.json") });
+    }
+
+    const call = (tokens: Record<string, unknown>, cost = 0): Record<string, unknown> => ({
+      time: { created: AT, completed: AT + 500 },
+      agent: "build",
+      model: { id: "mimo-v2.6-pro", providerID: "omni" },
+      finish: "stop",
+      cost,
+      tokens,
+      content: [{ type: "text", text: "SECRET TOOL OUTPUT" }],
+    });
+    const userRow = (id: string, session: string, text: string): Row => ({ id, session, type: "user", data: { time: { created: AT }, text, files: [] } });
+
+    it("reads prompts, calls, models and reasoning outside output, and skips other row types", async () => {
+      const db = setupV2([
+        { id: "s", session: "ses_1", type: "system", data: { time: { created: AT }, text: "instructions" } },
+        userRow("u1", "ses_1", "  what   time?  "),
+        { id: "a1", session: "ses_1", type: "assistant", data: call({ input: 8806, output: 57, reasoning: 43, cache: { read: 256, write: 0 } }, 0.2) },
+        { id: "i", session: "ses_1", type: "idle", data: { time: { created: AT }, outcome: "succeeded" } },
+      ]);
+      const got = await db.reportOf(["ses_1"], "UTC");
+      expect(got?.report.calls).toBe(1);
+      expect(got?.report.tokens).toEqual({ input: 8806, output: 100, cacheRead: 256, cacheWrite: 0, reasoning: 43 });
+      expect(got?.report.cost.total).toBeCloseTo(0.2);
+      expect(got?.report.turns?.map((t) => t.prompt)).toEqual(["what time?"]);
+      expect(JSON.stringify(got)).toContain("mimo-v2.6-pro");
+      expect(JSON.stringify(got)).not.toContain("SECRET TOOL OUTPUT");
+    });
+
+    it("counts a compaction as a call with its own cost and tokens", async () => {
+      const db = setupV2([
+        userRow("u1", "ses_1", "hello"),
+        {
+          id: "c1",
+          session: "ses_1",
+          type: "compaction",
+          data: { time: { created: AT }, status: "completed", reason: "manual", model: { id: "m", providerID: "p" }, summary: "SECRET SUMMARY", cost: 0.1, tokens: { input: 12604, output: 282, reasoning: 0, cache: { read: 42, write: 0 } } },
+        },
+      ]);
+      const got = await db.reportOf(["ses_1"], "UTC");
+      expect(got?.report.tokens).toMatchObject({ input: 12604, output: 282, cacheRead: 42 });
+      expect(got?.report.cost.total).toBeCloseTo(0.1);
+    });
+
+    it("counts failed and aborted calls that record no tokens", async () => {
+      const failed = (type: string): Record<string, unknown> => ({ time: { created: AT }, agent: "build", model: { id: "m", providerID: "p" }, finish: "error", error: { type, message: "SECRET ERROR" } });
+      const db = setupV2([
+        userRow("u1", "ses_1", "hello"),
+        { id: "a1", session: "ses_1", type: "assistant", data: failed("provider.auth") },
+        { id: "a2", session: "ses_1", type: "assistant", data: failed("aborted") },
+      ]);
+      const got = await db.reportOf(["ses_1"], "UTC");
+      expect(got?.report.calls).toBe(2);
+      expect(JSON.stringify(got)).not.toContain("SECRET ERROR");
+    });
+
+    it("counts subagent sessions from session_v2 under the thread's session, not as prompts", async () => {
+      const db = setupV2(
+        [
+          userRow("u1", "ses_parent", "delegate"),
+          { id: "a1", session: "ses_parent", type: "assistant", data: call({ input: 100, output: 10, reasoning: 0, cache: { read: 0, write: 0 } }) },
+          userRow("u2", "ses_child", "You are a subagent"),
+          { id: "a2", session: "ses_child", type: "assistant", data: call({ input: 50, output: 5, reasoning: 0, cache: { read: 1, write: 0 } }) },
+        ],
+        [{ id: "ses_parent" }, { id: "ses_child", parent: "ses_parent" }],
+      );
+      const got = await db.reportOf(["ses_parent"], "UTC");
+      expect(got?.report.calls).toBe(2);
+      expect(got?.report.tokens).toMatchObject({ input: 150, output: 15, cacheRead: 1 });
+      expect(got?.report.turns?.map((t) => t.prompt)).toEqual(["delegate"]);
+      expect(got?.report.agents?.rows.map((r) => r.id)).toEqual(["ses_child"]);
+    });
+
+    it("skips a malformed row and keeps the rest", async () => {
+      const db = setupV2([
+        { id: "bad", session: "ses_1", type: "assistant", data: "{not json" },
+        { id: "a1", session: "ses_1", type: "assistant", data: call({ input: 10, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }) },
+      ]);
+      expect((await db.reportOf(["ses_1"], "UTC"))?.report.calls).toBe(1);
+    });
+
+    it("still reads a session that is only in the older message table when both exist", async () => {
+      const db = setupV2([{ id: "a1", session: "ses_1", type: "assistant", data: call({ input: 10, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }) }], [], true);
+      expect((await db.reportOf(["ses_old"], "UTC"))?.report.tokens).toMatchObject({ input: 7, output: 3 });
+      expect((await db.reportOf(["ses_1"], "UTC"))?.report.tokens).toMatchObject({ input: 10, output: 1 });
+    });
+  });
 });

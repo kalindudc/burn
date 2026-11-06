@@ -8,6 +8,7 @@ import { READ_TIMEOUT_MS, WORKING_REFETCH_MS } from "../../extensions/bb/usage.j
 import { buildReport } from "../../src/report.js";
 import { modelRow, sampleReport } from "../helpers.js";
 import { answer, backend, THREAD } from "./fixtures.js";
+import { resetVisibility, setVisibility } from "./visibility.js";
 
 const toast = vi.hoisted(() => Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn(), warning: vi.fn(), info: vi.fn() }));
 vi.mock("sonner", () => ({ toast }));
@@ -16,6 +17,7 @@ const slots: RenderedSlot[] = [];
 beforeEach(() => vi.clearAllMocks());
 afterEach(() => {
   for (const slot of slots.splice(0)) slot.lifecycle.unmount();
+  resetVisibility();
   document.body.removeAttribute("data-split-pane-id");
   for (const footer of document.querySelectorAll("[data-follow-up-composer-footer]")) footer.remove();
 });
@@ -326,6 +328,59 @@ describe("Burn chip", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("a hidden page", () => {
+  it("neither reads a working thread every minute nor on usage signals, and reads once when it is visible again", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const server = backend(() => answer({ report: sampleReport({ running: true }), reportedAt: Date.now() }));
+      const slot = await renderChip(server);
+      await vi.waitFor(async () => expect((await chipButton(slot)).dataset.running).toBe(""));
+      expect(server.callsTo("usage")).toHaveLength(1);
+      setVisibility("hidden");
+      await slot.behavior.emitRealtime("usage", { threadId: THREAD });
+      await act(async () => {
+        vi.advanceTimersByTime(3 * WORKING_REFETCH_MS);
+      });
+      expect(server.callsTo("usage")).toHaveLength(1);
+      setVisibility("visible");
+      await vi.waitFor(() => expect(server.callsTo("usage")).toHaveLength(2));
+      await act(async () => {
+        vi.advanceTimersByTime(WORKING_REFETCH_MS);
+      });
+      await vi.waitFor(() => expect(server.callsTo("usage")).toHaveLength(3));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not start the read that signals during a read asked for, once the page is hidden", async () => {
+    let release: (value: UsageAnswer) => void = () => {};
+    let n = 0;
+    const server = backend(() => answer(), {
+      usage: () => (++n === 1 ? new Promise<UsageAnswer>((resolve) => (release = resolve)) : answer()),
+    });
+    const slot = await renderChip(server);
+    await vi.waitFor(() => expect(server.callsTo("usage")).toHaveLength(1));
+    await slot.behavior.emitRealtime("usage", { threadId: THREAD });
+    setVisibility("hidden");
+    release(answer());
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(server.callsTo("usage")).toHaveLength(1);
+    setVisibility("visible");
+    await vi.waitFor(() => expect(server.callsTo("usage")).toHaveLength(2));
+  });
+
+  it("owes no read when nothing was skipped while it was hidden", async () => {
+    const server = backend(() => answer({ report: sampleReport(), reportedAt: Date.now() }));
+    await renderChip(server);
+    await vi.waitFor(() => expect(server.callsTo("usage")).toHaveLength(1));
+    setVisibility("hidden");
+    setVisibility("visible");
+    await act(async () => {});
+    expect(server.callsTo("usage")).toHaveLength(1);
   });
 });
 

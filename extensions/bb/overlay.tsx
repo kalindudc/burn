@@ -6,7 +6,7 @@ import type { rpcContract } from "./contract.js";
 import { overBudgetStatus, setRowFlags } from "./flags.js";
 import { requestPanel } from "./panel-requests.js";
 import { readPrefs } from "./prefs.js";
-import { errorText, useOnReconnect } from "./usage.js";
+import { errorText, useOnReconnect, useWhenVisible } from "./usage.js";
 
 const SEEN_MAX = 500;
 const REFRESH_MS = 1000;
@@ -58,6 +58,8 @@ export function BurnOverlay(): ReactNode {
   const currentFlag = useRef(flagOverBudget);
   currentFlag.current = flagOverBudget;
   const mounted = useRef(true);
+  // The pass for signals that arrived during a check goes through the visibility gate, which is made below.
+  const replay = useRef<() => void>(() => {});
 
   const refresh = useCallback(function run() {
     if (!flagOverBudget) {
@@ -76,7 +78,7 @@ export function BurnOverlay(): ReactNode {
     const asked = ++latest.current;
     const done = (): void => {
       if (flight.current === mine) flight.current = null;
-      if (mine.again && flight.current === null && mounted.current && currentFlag.current) run();
+      if (mine.again && flight.current === null && mounted.current && currentFlag.current) replay.current();
     };
     rpc.call("overBudget", {}).then(
       ({ threads }) => {
@@ -102,14 +104,16 @@ export function BurnOverlay(): ReactNode {
     },
     [],
   );
+  const refreshVisible = useWhenVisible(refresh);
+  replay.current = refreshVisible;
   useRealtime(
     "usage",
     useCallback(() => {
       clearTimeout(timer.current);
-      timer.current = setTimeout(refresh, REFRESH_MS);
-    }, [refresh]),
+      timer.current = setTimeout(refreshVisible, REFRESH_MS);
+    }, [refreshVisible]),
   );
-  useOnReconnect(refresh);
+  useOnReconnect(refreshVisible);
   useRealtime(
     ALERT_CHANNEL,
     useCallback(

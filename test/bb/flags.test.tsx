@@ -5,6 +5,7 @@ import type { BurnAlert } from "../../extensions/bb/alerts.js";
 import type { rpcContract } from "../../extensions/bb/contract.js";
 import { overBudgetStatus, setRowFlags } from "../../extensions/bb/flags.js";
 import { backend, OTHER, THREAD } from "./fixtures.js";
+import { resetVisibility, setVisibility } from "./visibility.js";
 
 const toast = vi.hoisted(() => Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn(), warning: vi.fn(), info: vi.fn() }));
 vi.mock("sonner", () => ({ toast }));
@@ -16,6 +17,7 @@ afterEach(async () => {
   for (const slot of slots.splice(0)) slot.lifecycle.unmount();
   for (const mounted of scripts.splice(0)) await mounted.lifecycle.dispose();
   setRowFlags(new Map());
+  resetVisibility();
 });
 
 const FLAG = { icon: "burn-flame", label: "Over budget · $12.40 of $10", tone: "error" };
@@ -91,6 +93,44 @@ describe("the app overlay", () => {
     await vi.waitFor(() => expect(server.callsTo("overBudget")).toHaveLength(1));
     await slot.behavior.emitRealtime("usage", { threadId: THREAD });
     await vi.waitFor(() => expect(server.callsTo("overBudget")).toHaveLength(2), { timeout: 2500 });
+  });
+
+  it("does not check budgets while the page is hidden, and checks once when it is visible again", async () => {
+    const server = overBudget();
+    const slot = await renderOverlay(server);
+    await vi.waitFor(() => expect(server.callsTo("overBudget")).toHaveLength(1));
+    setVisibility("hidden");
+    await slot.behavior.emitRealtime("usage", { threadId: THREAD });
+    await slot.behavior.emitRealtime("usage", { threadId: OTHER });
+    await new Promise((resolve) => setTimeout(resolve, 1300));
+    expect(server.callsTo("overBudget")).toHaveLength(1);
+    setVisibility("visible");
+    await vi.waitFor(() => expect(server.callsTo("overBudget")).toHaveLength(2));
+    setVisibility("hidden");
+    setVisibility("visible");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(server.callsTo("overBudget")).toHaveLength(2);
+  });
+
+  it("does not start the check that signals during a check asked for, once the page is hidden", async () => {
+    let release: () => void = () => {};
+    let n = 0;
+    const server = backend(undefined, {
+      overBudget: () => {
+        const threads = [{ threadId: THREAD, cost: 12.4, budget: 10, estimated: false }];
+        return ++n === 1 ? new Promise<{ threads: typeof threads }>((resolve) => (release = () => resolve({ threads }))) : { threads };
+      },
+    });
+    const slot = await renderOverlay(server);
+    await vi.waitFor(() => expect(server.callsTo("overBudget")).toHaveLength(1));
+    await slot.behavior.emitRealtime("usage", { threadId: THREAD });
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    setVisibility("hidden");
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(server.callsTo("overBudget")).toHaveLength(1);
+    setVisibility("visible");
+    await vi.waitFor(() => expect(server.callsTo("overBudget")).toHaveLength(2));
   });
 
   it("shows each alert once per window, in the tone its kind deserves, with a way to the thread", async () => {

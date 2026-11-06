@@ -17,7 +17,7 @@ import { FLAME_ICON } from "./icon.js";
 import { requestPanel } from "./panel-requests.js";
 import { readPrefs } from "./prefs.js";
 import { copySummary } from "./summary.js";
-import { errorText, isThreadId, useOnReconnect } from "./usage.js";
+import { errorText, isThreadId, useOnReconnect, useWhenVisible } from "./usage.js";
 
 const BATCH_MAX = 200;
 const REFRESH_MS = 750;
@@ -40,6 +40,8 @@ export function useThreadCosts({ threadIds }: PluginThreadActionDataInput): Thre
   const pendingRefresh = useRef(false);
   const visible = useRef(threadIds);
   visible.current = threadIds;
+  // The reload for signals that arrived during a read goes through the visibility gate, which is made below.
+  const replay = useRef<() => void>(() => {});
 
   const load = useCallback(
     function load(ids: readonly string[], replace: boolean) {
@@ -50,7 +52,7 @@ export function useThreadCosts({ threadIds }: PluginThreadActionDataInput): Thre
       const settle = (): void => {
         if (pendingRefresh.current && asking.current.size === 0) {
           pendingRefresh.current = false;
-          load(visible.current, true);
+          replay.current();
         }
       };
       for (let i = 0; i < wanted.length; i += BATCH_MAX) {
@@ -85,10 +87,12 @@ export function useThreadCosts({ threadIds }: PluginThreadActionDataInput): Thre
   }, [threadIds, rows, load]);
 
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const reloadVisible = useWhenVisible(useCallback(() => load(visible.current, true), [load]));
+  replay.current = reloadVisible;
   const refreshVisible = useCallback(() => {
     clearTimeout(timer.current);
-    timer.current = setTimeout(() => load(visible.current, true), REFRESH_MS);
-  }, [load]);
+    timer.current = setTimeout(reloadVisible, REFRESH_MS);
+  }, [reloadVisible]);
   useEffect(() => () => clearTimeout(timer.current), []);
   useRealtime("usage", refreshVisible);
   useOnReconnect(refreshVisible);

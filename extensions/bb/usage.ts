@@ -22,6 +22,30 @@ export function signalThread(payload: unknown): string | null {
   return typeof id === "string" ? id : null;
 }
 
+/**
+ * A refresh that runs only while the page is in view. While it is hidden a call is remembered, and the page
+ * coming back into view runs the latest refresh once. A hidden window then asks bb for nothing, however many
+ * signals arrive. The returned function stays the same across renders.
+ */
+export function useWhenVisible(refresh: () => void): () => void {
+  const latest = useRef(refresh);
+  latest.current = refresh;
+  const owed = useRef(false);
+  useEffect(() => {
+    const show = (): void => {
+      if (document.visibilityState === "hidden" || !owed.current) return;
+      owed.current = false;
+      latest.current();
+    };
+    document.addEventListener("visibilitychange", show);
+    return () => document.removeEventListener("visibilitychange", show);
+  }, []);
+  return useCallback(() => {
+    if (document.visibilityState === "hidden") owed.current = true;
+    else latest.current();
+  }, []);
+}
+
 /** Runs `onChange` after a reconnect: plugin signals are not replayed, so anything may have changed meanwhile. */
 export function useOnReconnect(onChange: () => void): void {
   const connection = useRealtimeConnectionState();
@@ -55,6 +79,8 @@ export function useUsage(
   const current = useRef(key);
   current.current = key;
   const mounted = useRef(true);
+  // The replay for signals that arrived during a read goes through the visibility gate, which is made below.
+  const replay = useRef<() => void>(() => {});
 
   const refetch = useCallback(function run() {
     const key = `${threadId}:${listPrice}`;
@@ -73,7 +99,7 @@ export function useUsage(
       finished = true;
       clearTimeout(timer);
       flights.current.delete(key);
-      if (flight.again && mounted.current && current.current === key) run();
+      if (flight.again && mounted.current && current.current === key) replay.current();
     };
     const timer = setTimeout(done, READ_TIMEOUT_MS);
     rpc.call("usage", listPrice ? { threadId, listPrice: true } : { threadId }).then(
@@ -106,24 +132,26 @@ export function useUsage(
     };
   }, []);
   const withChildren = opts.withChildren === true;
+  const refetchVisible = useWhenVisible(refetch);
+  replay.current = refetchVisible;
   useRealtime(
     "usage",
     useCallback(
       (payload: unknown) => {
         const about = signalThread(payload);
-        if (about === null || about === threadId || (withChildren && children.current.has(about))) refetch();
+        if (about === null || about === threadId || (withChildren && children.current.has(about))) refetchVisible();
       },
-      [threadId, withChildren, refetch],
+      [threadId, withChildren, refetchVisible],
     ),
   );
-  useOnReconnect(refetch);
+  useOnReconnect(refetchVisible);
   const answer = held?.key === key ? held.answer : null;
   const working = answer?.report?.running === true;
   useEffect(() => {
     if (!working) return;
-    const timer = setInterval(refetch, WORKING_REFETCH_MS);
+    const timer = setInterval(refetchVisible, WORKING_REFETCH_MS);
     return () => clearInterval(timer);
-  }, [working, refetch]);
+  }, [working, refetchVisible]);
   return { answer, error, refetch };
 }
 

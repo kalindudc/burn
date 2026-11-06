@@ -6,6 +6,7 @@ import type { ThreadDirectory } from "./directory.js";
 import { createEventReader } from "./events.js";
 import { type Harness, harnessOf } from "./harnesses.js";
 import { HOST_BATCH, hostContract, hostSignals } from "./host/contract.js";
+import { createHostWatch } from "./hosts.js";
 import { sessionStem } from "./host/pi-sessions.js";
 import { logKey } from "./keys.js";
 import { usageReportSchema } from "./schema.js";
@@ -27,8 +28,9 @@ const HOST_WAIT_PENDING_MAX = 2 * HOST_WAIT_CONCURRENCY;
 const REPORT_TTL_MS = 60_000;
 /** How many threads are looked up at once: enough to use a fast bb, few enough not to swamp it. */
 const FACTS_CONCURRENCY = 32;
-/** How long an unreachable host is left alone, and how often its failure is logged. */
+/** How long an unreachable host is left alone after its first failure; each failure in a row doubles it, up to HOST_RETRY_MAX_MS. */
 const HOST_RETRY_MS = 60_000;
+const HOST_RETRY_MAX_MS = 30 * 60_000;
 const HOST_TIMEOUT_MS = 25_000;
 const SESSIONS_MAX = 32;
 /** bb's most thread events in one `threads.events.list` page, and its default. */
@@ -172,7 +174,9 @@ export function createReportSource(
   const saved = new Map<string, number>();
   // Bumped by reprice, so a host read that started before a price change does not persist or cache old-price figures.
   let priceGeneration = 0;
-  const failedAt = new Map<string, number>();
+  // A host that failed, when it last did and how long it is left alone. Present from its first failure until
+  // a read succeeds or bb says it connected, which is also how a failure is logged once, not on every attempt.
+  const failures = new Map<string, { at: number; delay: number }>();
   // The host read under way per thread, which a second caller joins instead of asking the host again, and
   // when the caller that started it stopped waiting: a joiner waits no longer, since that caller's late read signals.
   const reading = new Map<string, { run: Promise<void>; until: number }>();
@@ -474,7 +478,20 @@ export function createReportSource(
     const held = reports.get(threadId);
     return held !== undefined && now() - held.checkedAt < REPORT_TTL_MS;
   };
-  const hostDown = (hostId: string): boolean => now() - (failedAt.get(hostId) ?? Number.NEGATIVE_INFINITY) < HOST_RETRY_MS;
+  const hostDown = (hostId: string): boolean => {
+    const failure = failures.get(hostId);
+    return failure !== undefined && now() - failure.at < failure.delay;
+  };
+
+  /** A host that was not connected is again: forget its failures and read its threads again, since their logs may have changed meanwhile. */
+  function hostConnected(hostId: string): void {
+    failures.delete(hostId);
+    const hit: string[] = [];
+    for (const [threadId, f] of facts) if (f.hostId === hostId) hit.push(threadId);
+    for (const threadId of hit) invalidate(threadId);
+    if (hit.length > 0 && !disposed) opts.onChange(hit);
+  }
+  const hosts = createHostWatch(bb, { onConnect: hostConnected, now });
 
   async function save(threadId: string, got: LogReport, gen: number): Promise<void> {
     if (gen !== priceGeneration || saved.get(threadId) === got.at) return;
@@ -527,12 +544,18 @@ export function createReportSource(
           { hostId, timeoutMs: HOST_TIMEOUT_MS },
         );
       } catch (err) {
-        failedAt.set(hostId, now());
-        const what = harness === "claude" ? "Claude transcripts" : harness === "pi" ? "pi session logs" : "opencode's database";
-        bb.log.warn(`reading ${what} on ${hostId} failed, so Burn shows the last figures it read there: ${message(err)}`);
+        const failure = failures.get(hostId);
+        const at = now();
+        // Reads that were already under way when the host first failed also fail; they must not double the wait.
+        if (failure === undefined) failures.set(hostId, { at, delay: HOST_RETRY_MS });
+        else if (at - failure.at >= failure.delay) failures.set(hostId, { at, delay: Math.min(failure.delay * 2, HOST_RETRY_MAX_MS) });
+        if (failure === undefined) {
+          const what = harness === "claude" ? "Claude transcripts" : harness === "pi" ? "pi session logs" : "opencode's database";
+          bb.log.warn(`reading ${what} on ${hostId} failed, so Burn shows the last figures it read there and asks again after a growing wait: ${message(err)}`);
+        }
         return;
       }
-      failedAt.delete(hostId);
+      failures.delete(hostId);
       for (const { threadId, report, at } of answer.reports) {
         let got: LogReport | null = report !== null && at !== null ? { report, at, source: "log" } : null;
         if (gen === priceGeneration && harness === "claude" && got?.report.coverage === "partial") {
@@ -637,7 +660,7 @@ export function createReportSource(
           joined.set(under.run, Math.min(until, under.until));
           continue;
         }
-        if (hostId === null || hostDown(hostId)) continue;
+        if (hostId === null || !hosts.connected(hostId) || hostDown(hostId)) continue;
         const harness = reader === "claude-log" ? "claude" : reader === "opencode-db" ? "opencode" : "pi";
         const key = `${hostId}:${harness}`;
         const group = wanted.get(key) ?? { hostId, harness, threadIds: [] };
@@ -759,6 +782,7 @@ export function createReportSource(
     },
     dispose() {
       disposed = true;
+      hosts.dispose();
       hostQueue.clear();
       for (const timers of [retryTimers, hostTimers]) {
         for (const timer of timers.values()) clearTimeout(timer);

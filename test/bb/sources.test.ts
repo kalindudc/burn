@@ -31,12 +31,18 @@ type Thread = { host: string | null; provider?: string; status?: "active" | "idl
 /** A source over fake threads; each host answers with `costs[threadId]`, or throws when listed in `offline`. */
 function setup(
   threads: Record<string, Thread>,
-  opts: { offline?: string[]; directory?: boolean; coverageNote?: string; retryMs?: number; retryMax?: number; hostWaitStepsMs?: number[] } = {},
+  opts: { offline?: string[]; disconnected?: string[]; listFails?: boolean; directory?: boolean; coverageNote?: string; retryMs?: number; retryMax?: number; hostWaitStepsMs?: number[] } = {},
 ) {
   const costs: Record<string, number> = {};
   const rows: EventRow[] = [];
   const calls: ExperimentalFakeHostRpcCall[] = [];
   const offline = new Set(opts.offline ?? []);
+  // The hosts bb lists, and which of them it says are connected, as bb's host list and `host:changed` events report them.
+  const listed = new Map<string, boolean>([[A, true], [B, true]]);
+  for (const t of Object.values(threads)) if (t.host) listed.set(t.host, true);
+  for (const hostId of opts.disconnected ?? []) listed.set(hostId, false);
+  const watchers: Array<(event: { id?: string; changes: string[] }) => void> = [];
+  let hostLists = 0;
   let gate: Promise<void> | null = null;
   let getGate: Promise<void> | null = null;
   let getFails = false;
@@ -93,6 +99,17 @@ function setup(
         },
       },
       environments: { get: async ({ environmentId }: { environmentId: string }) => ({ id: environmentId, hostId: environmentId.slice(4) }) },
+      hosts: {
+        list: async () => {
+          hostLists++;
+          if (opts.listFails) throw new Error("bb is busy");
+          return [...listed].map(([hostId, connected]) => ({ id: hostId, status: connected ? "connected" : "disconnected" }));
+        },
+      },
+      subscribe: ((args: { callback: (event: { id?: string; changes: string[] }) => void }) => {
+        watchers.push(args.callback);
+        return () => void watchers.splice(watchers.indexOf(args.callback), 1);
+      }) as never,
     },
     experimental_callHostRpc: async (call) => {
       calls.push(call);
@@ -168,7 +185,19 @@ function setup(
   const failLookups = (on: boolean): void => {
     getFails = on;
   };
-  return { bb, harness, source, costs, rows, calls, asked, cost, changed, offline, hold, holdLookups, failLookups, holdIdentities, onIdentities, tick: (ms: number) => (now += ms) };
+  /** Lets the host list the source asks for when it is created come back. */
+  const hostsKnown = async (): Promise<void> => {
+    for (let n = 0; n < 5; n++) await Promise.resolve();
+  };
+  /** bb says the host connected or disconnected: a `host:changed` event, with the list following it. */
+  const hostChanged = (hostId: string, change: "host-connected" | "host-disconnected"): void => {
+    listed.set(hostId, change === "host-connected");
+    for (const watcher of [...watchers]) watcher({ id: hostId, changes: [change] });
+  };
+  /** A host that changed with no event reaching Burn: only the list shows it. */
+  const hostListed = (hostId: string, connected: boolean): void => void listed.set(hostId, connected);
+  const warnings = (): string[] => harness.inspection.logEntries.filter((e) => e.level === "warn").map((e) => e.message);
+  return { bb, harness, source, costs, rows, calls, hostsKnown, hostChanged, hostListed, hostLists: () => hostLists, warnings, watchers, asked, cost, changed, offline, hold, holdLookups, failLookups, holdIdentities, onIdentities, tick: (ms: number) => (now += ms) };
 }
 
 describe("createReportSource", () => {
@@ -916,6 +945,178 @@ describe("createReportSource", () => {
     await s.source.reportsOf([fork]);
     expect(s.calls[0]?.input).toMatchObject({ harness: "claude", threads: [{ threadId: fork, parentSessionIds: ["c_old", "c_new"] }] });
     await s.harness.lifecycle.dispose();
+  });
+});
+
+describe("createReportSource and hosts that are not connected", () => {
+  it("asks no host that bb lists as not connected, and shows the last figures it kept", async () => {
+    const s = setup({ [id(1)]: { host: A }, [id(2)]: { host: B } }, { disconnected: [A] });
+    s.costs[id(1)] = 4;
+    s.costs[id(2)] = 5;
+    await s.bb.storage.kv.set(`log:${id(1)}`, { report: costOf(3), at: 3000 });
+    await s.hostsKnown();
+    expect(await s.cost(id(1), id(2))).toEqual([3, 5]);
+    expect(s.asked(A)).toEqual([]);
+    expect(s.asked(B)).toEqual([[id(2)]]);
+    expect(s.warnings()).toEqual([]);
+  });
+
+  it("stops asking a host once bb says it disconnected, though its report has expired", async () => {
+    const s = setup({ [id(1)]: { host: A } });
+    s.costs[id(1)] = 4;
+    await s.hostsKnown();
+    expect(await s.cost(id(1))).toEqual([4]);
+    s.hostChanged(A, "host-disconnected");
+    s.tick(60_000);
+    expect(await s.cost(id(1))).toEqual([4]);
+    expect(s.calls).toHaveLength(1);
+    expect(s.warnings()).toEqual([]);
+  });
+
+  it("reads a host's threads again as soon as it connects, instead of serving what it held", async () => {
+    const s = setup({ [id(1)]: { host: A }, [id(2)]: { host: B } });
+    s.costs[id(1)] = 4;
+    s.costs[id(2)] = 5;
+    await s.hostsKnown();
+    expect(await s.cost(id(1), id(2))).toEqual([4, 5]);
+    s.hostChanged(A, "host-disconnected");
+    s.costs[id(1)] = 6;
+    s.costs[id(2)] = 7;
+    expect(await s.cost(id(1), id(2))).toEqual([4, 5]);
+    expect(s.calls).toHaveLength(2);
+    s.hostChanged(A, "host-connected");
+    expect(s.changed.at(-1)).toEqual([id(1)]);
+    expect(await s.cost(id(1), id(2))).toEqual([6, 5]);
+    expect(s.asked().at(-1)).toEqual([id(1)]);
+  });
+
+  it("reads a host again that only the host list shows as connected again, when a read finds it missing", async () => {
+    const s = setup({ [id(1)]: { host: A } }, { disconnected: [A] });
+    s.costs[id(1)] = 4;
+    await s.hostsKnown();
+    expect(await s.cost(id(1))).toEqual([null]);
+    expect(s.hostLists()).toBe(1);
+    s.hostListed(A, true);
+    s.tick(60_000);
+    expect(await s.cost(id(1))).toEqual([null]);
+    await s.hostsKnown();
+    expect(s.hostLists()).toBe(2);
+    expect(s.changed.at(-1)).toEqual([id(1)]);
+    expect(await s.cost(id(1))).toEqual([4]);
+  });
+
+  it("asks every host while bb cannot list them", async () => {
+    const s = setup({ [id(1)]: { host: A } }, { listFails: true });
+    s.costs[id(1)] = 4;
+    await s.hostsKnown();
+    expect(await s.cost(id(1))).toEqual([4]);
+    expect(s.asked(A)).toEqual([[id(1)]]);
+    s.tick(60_000);
+    s.costs[id(1)] = 5;
+    expect(await s.cost(id(1))).toEqual([5]);
+    expect(s.hostLists()).toBe(2);
+    expect(s.warnings()).toEqual([expect.stringContaining("listing bb's hosts failed")]);
+  });
+
+  it("stops watching hosts when it is disposed", async () => {
+    const s = setup({ [id(1)]: { host: A } });
+    expect(s.watchers).toHaveLength(1);
+    s.source.dispose();
+    expect(s.watchers).toHaveLength(0);
+  });
+});
+
+describe("createReportSource and a host that fails", () => {
+  it("logs the failure once, not on every attempt, and again after a read succeeds and fails later", async () => {
+    const s = setup({ [id(1)]: { host: A } }, { offline: [A] });
+    await s.hostsKnown();
+    for (let n = 0; n < 4; n++) {
+      await s.cost(id(1));
+      s.tick(30 * 60_000);
+    }
+    expect(s.calls).toHaveLength(4);
+    expect(s.warnings()).toHaveLength(1);
+    expect(s.warnings()[0]).toContain(`reading pi session logs on ${A} failed`);
+    s.offline.delete(A);
+    s.costs[id(1)] = 2;
+    expect(await s.cost(id(1))).toEqual([2]);
+    s.offline.add(A);
+    s.tick(60_000);
+    await s.cost(id(1));
+    expect(s.warnings()).toHaveLength(2);
+  });
+
+  it("waits a minute after the first failure, then twice as long each time, up to 30 minutes", async () => {
+    const s = setup({ [id(1)]: { host: A } }, { offline: [A] });
+    await s.hostsKnown();
+    await s.cost(id(1));
+    let calls = 1;
+    for (const wait of [60_000, 120_000, 240_000, 480_000, 960_000, 1_800_000, 1_800_000]) {
+      s.tick(wait - 1);
+      await s.cost(id(1));
+      expect(s.calls).toHaveLength(calls);
+      s.tick(1);
+      await s.cost(id(1));
+      expect(s.calls).toHaveLength(++calls);
+    }
+  });
+
+  it("starts again at a minute once a read succeeds", async () => {
+    const s = setup({ [id(1)]: { host: A } }, { offline: [A] });
+    await s.hostsKnown();
+    await s.cost(id(1));
+    for (const wait of [60_000, 120_000]) {
+      s.tick(wait);
+      await s.cost(id(1));
+    }
+    s.tick(240_000);
+    s.offline.delete(A);
+    s.costs[id(1)] = 2;
+    expect(await s.cost(id(1))).toEqual([2]);
+    s.tick(60_000);
+    s.offline.add(A);
+    await s.cost(id(1));
+    expect(s.calls).toHaveLength(5);
+    s.tick(59_999);
+    await s.cost(id(1));
+    expect(s.calls).toHaveLength(5);
+    s.tick(1);
+    await s.cost(id(1));
+    expect(s.calls).toHaveLength(6);
+  });
+
+  it("starts again at a minute, and logs again, when the host reconnects", async () => {
+    const s = setup({ [id(1)]: { host: A } }, { offline: [A] });
+    await s.hostsKnown();
+    await s.cost(id(1));
+    s.tick(60_000);
+    await s.cost(id(1));
+    expect(s.calls).toHaveLength(2);
+    s.hostChanged(A, "host-disconnected");
+    s.hostChanged(A, "host-connected");
+    await s.cost(id(1));
+    expect(s.calls).toHaveLength(3);
+    expect(s.warnings()).toHaveLength(2);
+    s.tick(60_000);
+    await s.cost(id(1));
+    expect(s.calls).toHaveLength(4);
+  });
+
+  it("counts reads that failed together as one failure", async () => {
+    const s = setup({ [id(1)]: { host: A }, [id(2)]: { host: A, provider: "acp-opencode" } }, { offline: [A] });
+    await s.hostsKnown();
+    await s.cost(id(1), id(2));
+    expect(s.calls).toHaveLength(2);
+    expect(s.warnings()).toHaveLength(1);
+    s.tick(60_000);
+    await s.cost(id(1), id(2));
+    expect(s.calls).toHaveLength(4);
+    s.tick(60_000);
+    await s.cost(id(1), id(2));
+    expect(s.calls).toHaveLength(4);
+    s.tick(60_000);
+    await s.cost(id(1), id(2));
+    expect(s.calls).toHaveLength(6);
   });
 });
 

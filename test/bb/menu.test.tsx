@@ -7,12 +7,14 @@ import type { rpcContract } from "../../extensions/bb/contract.js";
 import { costAction, costDetail, type ThreadCosts, useThreadCosts } from "../../extensions/bb/menu.js";
 import { registerPanelOpener } from "../../extensions/bb/panel-requests.js";
 import { backend, CHILD, costRow, OTHER, THREAD } from "./fixtures.js";
+import { resetVisibility, setVisibility } from "./visibility.js";
 
 vi.mock("sonner", () => ({ toast: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn(), warning: vi.fn() }) }));
 
 const slots: RenderedSlot[] = [];
 afterEach(() => {
   for (const slot of slots.splice(0)) slot.lifecycle.unmount();
+  resetVisibility();
 });
 
 const target = (id: string): PluginThreadActionTarget => ({
@@ -115,6 +117,41 @@ describe("useThreadCosts", () => {
     await hook.slot.behavior.emitRealtime("usage", { threadId: CHILD });
     await hook.slot.behavior.emitRealtime("usage", { threadId: THREAD });
     await vi.waitFor(() => expect(server.callsTo("costs")).toHaveLength(2), { timeout: 2000 });
+    expect(server.callsTo("costs")[1]?.input).toEqual({ threadIds: [THREAD, CHILD] });
+  });
+
+  it("does not start the reload that signals during a read asked for, once the page is hidden", async () => {
+    let release: () => void = () => {};
+    let n = 0;
+    const server = backend(undefined, {
+      costs: ({ threadIds }) => {
+        const threads = threadIds.map((threadId) => costRow({ threadId }));
+        return ++n === 1 ? new Promise<{ threads: typeof threads }>((resolve) => (release = () => resolve({ threads }))) : { threads };
+      },
+    });
+    const hook = renderHookSlot(server, [THREAD, CHILD]);
+    await vi.waitFor(() => expect(server.callsTo("costs")).toHaveLength(1));
+    await hook.slot.behavior.emitRealtime("usage", { threadId: CHILD });
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    setVisibility("hidden");
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(server.callsTo("costs")).toHaveLength(1);
+    setVisibility("visible");
+    await vi.waitFor(() => expect(server.callsTo("costs")).toHaveLength(2));
+    expect(server.callsTo("costs")[1]?.input).toEqual({ threadIds: [THREAD, CHILD] });
+  });
+
+  it("fetches nothing on usage signals while the page is hidden, and refetches once when it is visible again", async () => {
+    const server = backend();
+    const hook = renderHookSlot(server, [THREAD, CHILD]);
+    await vi.waitFor(() => expect(hook.rows().size).toBe(2));
+    setVisibility("hidden");
+    await hook.slot.behavior.emitRealtime("usage", { threadId: CHILD });
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    expect(server.callsTo("costs")).toHaveLength(1);
+    setVisibility("visible");
+    await vi.waitFor(() => expect(server.callsTo("costs")).toHaveLength(2));
     expect(server.callsTo("costs")[1]?.input).toEqual({ threadIds: [THREAD, CHILD] });
   });
 });

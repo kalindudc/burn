@@ -365,6 +365,13 @@ describe("createOpencodeDb", () => {
       expect((await db.reportOf(["ses_1"], "UTC"))?.report.calls).toBe(1);
     });
 
+    it("reads a session in both tables from session_message only, so it does not count twice", async () => {
+      const db = setupV2([{ id: "a1", session: "ses_old", type: "assistant", data: call({ input: 10, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }) }], [], true);
+      const got = await db.reportOf(["ses_old"], "UTC");
+      expect(got?.report.calls).toBe(1);
+      expect(got?.report.tokens).toMatchObject({ input: 10, output: 1 });
+    });
+
     it("still reads a session that is only in the older message table when both exist", async () => {
       const db = setupV2([{ id: "a1", session: "ses_1", type: "assistant", data: call({ input: 10, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }) }], [], true);
       expect((await db.reportOf(["ses_old"], "UTC"))?.report.tokens).toMatchObject({ input: 7, output: 3 });

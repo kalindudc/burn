@@ -47,6 +47,10 @@ interface MessageRow {
   time_updated: number;
 }
 
+interface SessionMessageRow extends MessageRow {
+  type: string;
+}
+
 interface UserPartRow {
   message_id: string;
   type: unknown;
@@ -78,6 +82,27 @@ function parse(value: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * An opencode 2 session_message row as the assistant or user message data of the
+ * older message table, which the rest of this file reads. A compaction is a model
+ * call with its own cost and tokens. A failed call may record no tokens at all.
+ */
+function legacyData(type: string, data: Record<string, unknown>): Record<string, unknown> {
+  if (type === "user") return { ...data, role: "user" };
+  const model = isRecord(data.model) ? data.model : {};
+  const failure = isRecord(data.error) ? { name: data.error.type === "aborted" ? "MessageAbortedError" : data.error.type } : undefined;
+  return {
+    role: "assistant",
+    time: data.time,
+    providerID: model.providerID,
+    modelID: model.id,
+    cost: data.cost,
+    finish: data.finish,
+    tokens: data.tokens ?? (failure === undefined ? undefined : {}),
+    ...(failure === undefined ? {} : { error: failure }),
+  };
 }
 
 function ratesOf(catalog: unknown, providerId: string, modelId: string): Rates | null {
@@ -146,6 +171,9 @@ function usageOf(data: Record<string, unknown>, rates: Rates | null): Usage | nu
   };
   return { input, output, cacheRead, cacheWrite, reasoning, cost, estimated: recorded <= 0 && rawTotal > 0 };
 }
+
+const hasTable = (db: DatabaseSync, name: string): boolean =>
+  db.prepare("select 1 from sqlite_master where type = 'table' and name = ?").get(name) !== undefined;
 
 const collapse = (text: string): string => text.replace(/\s+/g, " ").trim();
 
@@ -222,9 +250,11 @@ export function createOpencodeDb(opts: { path: string; modelsPath?: string }): O
   /** The thread's sessions and, below them, the subagent sessions opencode's task tool opened, marked as children. */
   function withChildren(db: DatabaseSync, ids: readonly string[]): { id: string; child: boolean }[] {
     const all = new Map<string, boolean>(ids.map((id) => [id, false]));
-    let children: ReturnType<DatabaseSync["prepare"]>;
+    const children: ReturnType<DatabaseSync["prepare"]>[] = [];
     try {
-      children = db.prepare("select id from session where parent_id = ?");
+      for (const table of ["session_v2", "session"]) {
+        if (hasTable(db, table)) children.push(db.prepare(`select id from ${table} where parent_id = ?`));
+      }
     } catch (err) {
       warnOnce("opencode's session table has no parent_id column, so subagent sessions are not counted", err);
       return [...all].map(([id, child]) => ({ id, child }));
@@ -233,10 +263,12 @@ export function createOpencodeDb(opts: { path: string; modelsPath?: string }): O
     for (let depth = 0; depth < CHILD_DEPTH_MAX && level.length > 0; depth++) {
       const next: string[] = [];
       for (const parent of level) {
-        for (const row of children.all(parent) as unknown as { id: string }[]) {
-          if (all.has(row.id)) continue;
-          all.set(row.id, true);
-          next.push(row.id);
+        for (const table of children) {
+          for (const row of table.all(parent) as unknown as { id: string }[]) {
+            if (all.has(row.id)) continue;
+            all.set(row.id, true);
+            next.push(row.id);
+          }
         }
       }
       level = next;
@@ -256,11 +288,19 @@ export function createOpencodeDb(opts: { path: string; modelsPath?: string }): O
         return null;
       }
       try {
-        const messages = db.prepare(
-          "select id, data, time_created, time_updated from message where session_id = ? order by time_created desc, id desc limit ?",
-        );
+        // opencode 2 keeps messages in session_message; json_remove leaves a call's content, which holds tool output, unread.
+        const sessionMessages = hasTable(db, "session_message")
+          ? db.prepare(
+              "select id, type, iif(json_valid(data), json_remove(data, '$.content'), data) as data, time_created, time_updated from session_message " +
+                "where session_id = ? and type in ('user', 'assistant', 'compaction') order by seq desc limit ?",
+            )
+          : null;
+        const hasMessageTable = hasTable(db, "message");
+        const messages = hasMessageTable
+          ? db.prepare("select id, data, time_created, time_updated from message where session_id = ? order by time_created desc, id desc limit ?")
+          : null;
         // cross join keeps SQLite on the message index, so it reads the parts of user messages only, never tool output.
-        const userParts = db.prepare(
+        const userParts = !hasMessageTable ? null : db.prepare(
           "select p.message_id, json_extract(p.data, '$.type') as type, json_extract(p.data, '$.text') as text, json_extract(p.data, '$.prompt') as prompt, " +
             "json_extract(p.data, '$.synthetic') as synthetic, json_extract(p.data, '$.ignored') as ignored " +
             "from message m cross join part p on p.message_id = m.id where m.session_id = ? and json_extract(m.data, '$.role') = 'user' order by p.time_created, p.id",
@@ -269,12 +309,16 @@ export function createOpencodeDb(opts: { path: string; modelsPath?: string }): O
         let at = 0;
         for (const { id: sessionId, child } of withChildren(db, ids)) {
           // Oldest first again: the stable sort below keeps a prompt before a call stamped in the same millisecond.
-          const rows = (messages.all(sessionId, MESSAGES_MAX) as unknown as MessageRow[]).reverse();
+          const current = ((sessionMessages?.all(sessionId, MESSAGES_MAX) ?? []) as unknown as SessionMessageRow[]).reverse();
+          const rows = current.length > 0 ? current : ((messages?.all(sessionId, MESSAGES_MAX) ?? []) as unknown as MessageRow[]).reverse();
           if (rows.length === 0) continue;
-          const prompts = child ? new Map<string, Prompt>() : promptsOf(userParts.all(sessionId) as unknown as UserPartRow[]);
+          const prompts =
+            child || current.length > 0 || userParts === null ? new Map<string, Prompt>() : promptsOf(userParts.all(sessionId) as unknown as UserPartRow[]);
           for (const row of rows) {
-            const data = parse(row.data);
-            if (data === null) continue;
+            const parsed = parse(row.data);
+            if (parsed === null) continue;
+            const data = "type" in row ? legacyData(row.type as string, parsed) : parsed;
+            if ("type" in row && data.role === "user" && !child) prompts.set(row.id, { typed: true, text: collapse(typeof data.text === "string" ? data.text : "") });
             const time = isRecord(data.time) ? data.time : {};
             const created = num(time.created) || num(row.time_created);
             if (created <= 0) continue;

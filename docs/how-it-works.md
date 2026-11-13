@@ -15,6 +15,11 @@ When a harness passes bb its own cost, Burn uses that cost as it is. Codex and C
 
 Burn reads and keeps list prices, and applies the discounts in its settings each time it answers. So a changed discount applies at once, to past figures as well, with nothing to rebuild. See [Discounts](bb.md#discounts).
 
+### Separate machine-wide accounting
+
+Burn's **Machine usage** view runs the optional CodeBurn CLI through the same BB-owned host entry, on the selected connected machine. Its `codeburn*` RPC methods, short-lived scans, report snapshots, confirmation tickets and export leases are independent of Burn's thread ledger. Nothing from CodeBurn is added to thread costs or budgets, and Burn's discounts and price overrides do not alter CodeBurn results. See [Machine usage](bb.md#machine-usage-with-codeburn) for scope, safety and CLI requirements.
+
+
 ## Reading pi's session logs and opencode's database
 
 The bb plugin has a host entry: code that bb runs on every connected machine. It reads the session log that bb's pi bridge keeps for each pi thread on that machine, and builds the same report pi would.

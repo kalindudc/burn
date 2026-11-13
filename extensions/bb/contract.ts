@@ -2,6 +2,7 @@ import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { agentUsageSchema, policySchema, THREAD_ID, usageReportSchema } from "./schema.js";
 import { spendMethods } from "./spend/contract.js";
+import { codeburnMethods } from "./codeburn/contract.js";
 
 const amount = z.number().finite().nonnegative();
 const count = z.number().int().nonnegative();
@@ -85,6 +86,7 @@ export const rpcContract = defineRpcContract({
     output: z.object({ threads: z.array(z.object({ threadId: z.string(), cost: amount, budget: z.number().positive(), estimated: z.boolean() })) }),
   },
   ...spendMethods,
+  ...codeburnMethods,
 });
 
 export type UsageAnswer = z.infer<typeof usageOutput>;

@@ -6,7 +6,7 @@ The bb plugin shows what every thread has cost, whatever harness runs it: pi, Op
 
 The chip sits beside the context circle under the prompt box. Like pi's footer, it shows the thread's own cost. While the thread works, and for a moment after its cost changes, it also shows what the last prompt added. Near or over its budget, it shows the budget instead. Click it for a card with the breakdown: where the money went, a chart of each call, the models used, and the total with the thread's child threads, such as minions. From the card you can open the Burn tab in the side panel, set a budget for the thread, or copy a summary.
 
-On a phone, bb shows the row under the prompt box only while the prompt box is expanded. Until then, a flame button in the thread header stands in for the chip and opens the same card.
+On a phone, bb shows the row under the prompt box only while the prompt box is expanded. Until then, a flame button in the native thread context row stands in for the chip and opens the same card. On wider screens without the footer, that context row shows the full chip.
 
 ![The Burn card above the chip: $4.27 for this thread, $4.40 with its child thread](../assets/screenshots/bb-chip-card.png)
 
@@ -29,7 +29,7 @@ The Burn tab in the thread's side panel lists every prompt with its cost, and ad
 
 ## The Burn page
 
-The **Burn** page in bb's navigation shows spend across all threads by day, project, model and harness.
+The **Burn** page has two accounting scopes. **BB threads** shows spend across all threads by day, project, model and harness; existing `spend/7d/...` links still open this view. **Machine usage** opens the optional CodeBurn integration at `spend/machine`.
 
 ![The Burn page for the last 30 days: cost and usage cards, spend per day by model, token mix and call time](../assets/screenshots/bb-burn-page.png)
 
@@ -60,6 +60,28 @@ The panels:
 
 ![The Burn page's tables: costliest threads, models, and spend by project and by harness](../assets/screenshots/bb-burn-tables.png)
 
+## Machine usage with CodeBurn
+
+Choose **Machine usage** and a connected BB machine with the standalone **CodeBurn CLI 0.9.28 or newer**. Its export format must be `codeburn.export.v3`. Burn does not install the CLI or a desktop/menu-bar companion. If `codeburn` is not on that machine's PATH, set **CodeBurn CLI executable** to the absolute executable path, without shell arguments.
+
+**Reports & settings** contains 27 CLI-backed reports: overview and history; models, sessions and Claude-only session diagnosis; PR references, branches, spend flows and experimental yield; model/cohort/period comparisons; plans and live quota; optimization findings and measured fixes; audits, provider diagnostics, pricing settings, and device/sharing state. Opening the overview performs one scan. Other reports and explicit refreshes run on demand; there is no periodic polling. Quota may contact providers using CodeBurn's existing sign-in, and device discovery is an explicit network action.
+
+Results include their scan time and scope. Objects and arrays open as drilldowns, with breadcrumbs, search and 50-row pages. Snapshot paths stay tied to the same population; snapshots expire after five minutes or host-worker disposal, and an expired snapshot requires a refresh. Native history can include dates beyond the current headline period; the displayed scope note explains this.
+
+**Raw export tables** retains all nine views: daily spend, activity, models, projects, sessions, tools, MCP, shell commands and records. Searches and pages do not change the whole-period summary. Successful scans are briefly reused for table navigation.
+
+CodeBurn's saved `~/.config/codeburn/app-filter.json` applies to scoped reports, raw tables and exports. Temporary includes cannot widen saved visibility, and unreadable filters fail closed. Account-wide reports identify themselves rather than pretending project filters narrow subscription bills. Child commands disable implicit Cursor synchronization without changing saved settings.
+
+**Configuration** supports currency, model aliases, explicit input/output prices, plans, saved project visibility, sharing-identity initialization and forgetting a paired device. **Preview change** shows the exact command and effect without changing configuration. **Confirm change** consumes a single-use ticket bound to that executable and machine, expiring after 60 seconds. Mutations are serialized and invalidate report caches even on failure. If a write is interrupted, inspect its state before trying again; Burn does not retry mutations automatically.
+
+**Exports** creates native CSV or JSON files for the selected scope. The browser reads only leased regular files in bounded chunks, and BB's save-file API owns the download/share handoff. “Save requested” does not claim that a native save dialog completed. Two leases at most are retained, each limited to 64 MiB and five minutes; release, expiry and worker disposal clean temporary output.
+
+Machine-wide figures mix recorded costs and estimates, not invoices. **Do not add them to BB-thread totals:** the populations overlap. Burn's thread budgets, alerts, discounts and price overrides do not affect CodeBurn, and CodeBurn configuration does not change those Burn settings. Missing CLI, offline machines, failed scans, unsupported filters and timeouts remain visible errors, not invented zeroes. Empty tables are not proof that unsupported telemetry never occurred.
+
+The integration starts no sharing service, collector, companion, or scheduled sync; it does not alter Guard hooks or apply optimization fixes. The CLI determines provider coverage and limitations. Preserve its caches and provider logs.
+
+Agents can use the bundled `burn-codeburn` skill and Burn's native RPC methods: `codeburnMachines`, `codeburnStatistics`, `codeburnReport`, `codeburnPreviewAction`, `codeburnConfirmAction`, `codeburnExportStart`, `codeburnExportRead`, and `codeburnExportEnd`.
+
 ## Budgets
 
 Burn warns at 80% and at 100% of a thread's budget. It never stops a thread unless you turn on **Stop a thread at its budget**, which is off by default.
@@ -72,7 +94,7 @@ Set a thread's own budget from the chip, the thread menu or the Burn tab. The **
 
 Burn's dollar figures are list prices, the published price per token. If you pay less, for example at a contract rate, set **Discount (%)** in Burn's settings. 16 means you pay 84% of list price. A negative number raises prices instead: -10 adds 10%. Four more settings each replace the discount for one line item: uncached input, output, cache reads or cache writes. Leave them empty to use **Discount (%)**.
 
-Every cost Burn shows uses your discounts: the chip, the card, the Burn tab, the Burn page and the thread menu, and also budgets, budget alerts, the daily budget, the sidebar flag and the stop at budget. The pi extension's own stop is the exception; see [prices](troubleshooting.md#prices). The card, the Burn tab and the Burn page say when their figures include discounts. The **With discounts · List price** switch, in the Burn tab and on the Burn page, shows the same figures at list price, to compare.
+Every **BB-thread** cost Burn shows uses your discounts: the chip, the card, the Burn tab, the BB threads page and the thread menu, and also budgets, budget alerts, the daily budget, the sidebar flag and the stop at budget. CodeBurn's Machine usage is independent and is not discounted by Burn. The pi extension's own stop is the other exception; see [prices](troubleshooting.md#prices). The card, the Burn tab and the BB threads page say when their figures include discounts. The **With discounts · List price** switch, in the Burn tab and on the BB threads page, shows the same figures at list price, to compare.
 
 A thread's total, each day's total and the split by line item are exact. Figures per call, per prompt and per model hold only a total, so when the line items have different discounts, they take the thread's overall discount. With one discount for everything, every figure is exact. A cost that a harness reports as one total, with no split by line item, is shown as reported.
 
@@ -82,7 +104,7 @@ These are in Burn's plugin settings.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| Cost chip | on | Shows the chip beside the context circle, or in the thread header when that row is not on screen, where a phone shows the flame alone. |
+| Cost chip | on | Shows the chip beside the context circle, or in the native thread context row when the footer is not on screen, where a phone shows the flame alone. |
 | Chip shows | Cost and last turn | Or the cost only. |
 | Thread budget | none | A budget for every thread. A thread's own budget, set from the chip or the thread menu, overrides it. |
 | Daily budget | none | One notification a day when all threads together pass it. |
@@ -91,8 +113,9 @@ These are in Burn's plugin settings.
 | Flag threads over budget | on | The red flame in the sidebar. |
 | Notify after an expensive prompt | off | A notification after a prompt that costs at least 3 times the thread's median and at least $0.50. |
 | Price overrides (JSON) | empty | Rates in dollars per million tokens for models the built-in list does not price, such as router aliases or contract rates: `{"model-id": {"input": 3, "output": 15, "cacheRead": 0.3, "cacheWrite": 3.75}}`. Input and output are required; cache rates default to 0. An override replaces that model's whole built-in row, including any long-context price tier. Burn uses these rates for Claude Code and Codex threads, whose tokens it prices itself. pi and OpenCode threads keep the cost their harness recorded. |
-| Discount (%) | 0 | Percent off list price for every cost Burn shows, budgets included. 16 means you pay 84% of list price, and a negative number raises prices. 0 is list price. See [Discounts](#discounts). |
+| Discount (%) | 0 | Percent off BB-thread costs, budgets included; not CodeBurn machine usage. 16 means you pay 84% of list price, and a negative number raises prices. 0 is list price. See [Discounts](#discounts). |
 | Input discount (%) | empty | Replaces **Discount (%)** for uncached input tokens. |
 | Output discount (%) | empty | Replaces **Discount (%)** for output tokens, reasoning included. |
 | Cache read discount (%) | empty | Replaces **Discount (%)** for cache reads. |
 | Cache write discount (%) | empty | Replaces **Discount (%)** for cache writes. |
+| CodeBurn CLI executable | `codeburn` | Optional machine-wide reports: CodeBurn 0.9.28+ on the selected machine's PATH, or an absolute executable path. No shell arguments. |

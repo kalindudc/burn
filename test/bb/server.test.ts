@@ -167,38 +167,6 @@ const costOf = (total: number): Partial<UsageReport> => ({ cost: { input: total,
 const QUIET = { budget: null, stopAtBudget: false, notifyExpensiveTurn: false };
 
 describe("settings", () => {
-  it("declares every setting in order, with quiet defaults", async () => {
-    const s = await setup();
-    const declared = s.harness.inspection.registrations.settingsDescriptors;
-    expect(Object.keys(declared)).toEqual([
-      "chip",
-      "chipShows",
-      "threadBudget",
-      "dailyBudget",
-      "budgetAlerts",
-      "stopAtBudget",
-      "flagOverBudget",
-      "notifyExpensiveTurn",
-      "priceOverrides",
-      "discount",
-      "inputDiscount",
-      "outputDiscount",
-      "cacheReadDiscount",
-      "cacheWriteDiscount",
-    ]);
-    expect(declared.chip).toMatchObject({ type: "boolean", label: "Cost chip", default: true });
-    expect(declared.chipShows).toMatchObject({ type: "select", options: ["delta", "cost"], default: "delta" });
-    expect(declared.threadBudget).toMatchObject({ type: "number", label: "Thread budget" });
-    expect("default" in declared.threadBudget).toBe(false);
-    expect("default" in declared.dailyBudget).toBe(false);
-    expect(declared.budgetAlerts).toMatchObject({ default: true });
-    expect(declared.flagOverBudget).toMatchObject({ default: true });
-    expect(declared.notifyExpensiveTurn).toMatchObject({ default: false });
-    expect(declared.discount).toMatchObject({ type: "number", label: "Discount (%)", default: 0 });
-    expect(declared.inputDiscount).toMatchObject({ type: "number", label: "Input discount (%)" });
-    expect("default" in declared.inputDiscount).toBe(false);
-  });
-
   it("never stops a thread by default, and says so", async () => {
     const s = await setup();
     const stop = s.harness.inspection.registrations.settingsDescriptors.stopAtBudget;

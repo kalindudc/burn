@@ -19,6 +19,7 @@ import { withOwnedThreads, spawnedTurnCost } from "./family.js";
 import { coalesce } from "./coalesce.js";
 import { checkDailyBudget, createSpendHandlers, type SpendDeps } from "./spend/server.js";
 import { ensureUsageSecret, sameToken, usageToken } from "./usage-auth.js";
+import { createCodeburnHandlers } from "./codeburn/server.js";
 
 export { rpcContract } from "./contract.js";
 
@@ -146,6 +147,12 @@ export const SETTINGS = {
     label: "Cache write discount (%)",
     description: "Replaces the discount above for cache writes. Empty means the discount above.",
     experimental_schema: discountSetting,
+  },
+  codeburnCliPath: {
+    type: "string",
+    label: "CodeBurn CLI executable",
+    description: "Optional machine-wide reports: CodeBurn 0.9.28 or newer on the selected machine's PATH, or an absolute executable path. No shell arguments. Used only when machine reports are requested.",
+    default: "codeburn",
   },
 } satisfies PluginSettingDescriptors;
 
@@ -702,6 +709,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     overBudget: overBudgetRead,
     ...spendHandlers,
     spend: spendRead,
+    ...createCodeburnHandlers(bb, async () => (await settings.get()).codeburnCliPath),
   });
 
   // The Burn pi extension reports each change here (extensions/pi/bb-report.ts) and applies the policy in the reply.

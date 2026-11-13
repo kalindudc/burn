@@ -1,7 +1,7 @@
 {
   "name": "burn",
   "version": "0.9.4",
-  "description": "See what each thread has cost: a pill in pi's footer and in bb's prompt-box footer, per-prompt breakdowns, budgets, and spend across threads.",
+  "description": "Thread costs, budgets and per-prompt breakdowns in pi and bb, plus optional machine-wide CodeBurn reports, settings and exports in bb.",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -20,19 +20,19 @@
     }
   ],
   "engines": {
-    "bb": ">=0.46",
-    "bbPluginSdk": ">=0.6.49"
+    "bb": ">=0.49",
+    "bbPluginSdk": ">=0.6.132"
   },
   "bb": {
     "name": "Burn",
-    "description": "See what each thread has cost, per prompt and across threads, with budgets.",
+    "description": "Thread costs and budgets, plus optional machine-wide CodeBurn reports, settings and exports.",
     "branding": {
       "icon": "./assets/icon.svg"
     },
     "server": "./extensions/bb/server.ts",
     "app": "./extensions/bb/app.tsx",
     "host": "./extensions/bb/host/entry.ts",
-    "skills": []
+    "skills": ["skills/burn-codeburn"]
   },
   "pi": {
     "extensions": [
@@ -72,7 +72,7 @@
     "@earendil-works/pi-ai": "1.3.0",
     "@earendil-works/pi-coding-agent": "1.5.0",
     "@earendil-works/pi-tui": "1.3.0",
-    "@get-bb/plugin-sdk": "0.6.49",
+    "@get-bb/plugin-sdk": "0.6.132",
     "@radix-ui/react-popover": "^1.3.1",
     "@testing-library/react": "^16.3.2",
     "@types/better-sqlite3": "^7.6.12",
@@ -88,7 +88,7 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "sonner": "^1.7.4",
-    "tailwind-merge": "^3.4.0",
+    "tailwind-merge": "^3.7.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.5"
   }

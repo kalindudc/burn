@@ -1,4 +1,4 @@
-import { type PluginThreadHeaderActionProps, useBbNavigate, useSettings } from "@get-bb/plugin-sdk/app";
+import { type ExperimentalThreadContextSegmentProps, experimental_useAppPanel, useSettings } from "@get-bb/plugin-sdk/app";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { budgetFraction, budgetState } from "../../src/budget.js";
@@ -116,8 +116,8 @@ const TONES: Record<ChipTone, { chip: string; flame: string }> = {
   waiting: { chip: "border-dashed border-border bg-transparent text-muted-foreground", flame: "text-muted-foreground" },
 };
 
-/** "compact" is the flame alone, for a phone's header, where the full chip leaves no room for the title. */
-type Placement = "footer" | "header" | "compact";
+/** "compact" is the flame alone when the thread context row is narrow. */
+type Placement = "footer" | "context" | "compact";
 
 function ChipFace({ view, fresh, placement }: { view: ChipView; fresh: "in" | "out" | null; placement: Placement }) {
   const tone = TONES[view.tone];
@@ -156,7 +156,7 @@ function ChipFace({ view, fresh, placement }: { view: ChipView; fresh: "in" | "o
 
 function BurnChip({ threadId, answer, placement }: { threadId: string; answer: UsageAnswer | null; placement: Placement }) {
   const prefs = readPrefs(useSettings().values);
-  const navigate = useBbNavigate();
+  const panel = experimental_useAppPanel();
   const now = useNow(30_000);
   const fresh = useFreshness(answer?.report ? answer.report.cost.total + (answer.family.total ?? 0) : null);
   const [open, setOpen] = useState(false);
@@ -177,7 +177,7 @@ function BurnChip({ threadId, answer, placement }: { threadId: string; answer: U
             "relative inline-flex shrink-0 cursor-pointer items-center overflow-hidden rounded-full border border-transparent text-xs whitespace-nowrap tabular-nums",
             "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring data-[state=open]:ring-1 data-[state=open]:ring-ring",
             placement === "compact" ? "size-7 justify-center" : "gap-1 pr-2 pl-1.5",
-            placement === "footer" ? "h-5" : placement === "header" && "h-6",
+            placement === "footer" ? "h-5" : placement === "context" && "h-6",
             TONES[view.tone].chip,
           )}
         >
@@ -205,7 +205,7 @@ function BurnChip({ threadId, answer, placement }: { threadId: string; answer: U
           now={now}
           onOpenDetails={() => {
             setOpen(false);
-            openPanelIn(navigate, null);
+            openPanelIn(panel, null);
           }}
           onCopy={async () => (answer?.report ? copySummary(answer.report, answer.title, answer.budget) : false)}
         />
@@ -214,20 +214,22 @@ function BurnChip({ threadId, answer, placement }: { threadId: string; answer: U
   );
 }
 
-/**
- * A thread header action, which bb always mounts, unlike a prompt-box action. It shows the chip beside
- * the context circle under the prompt box, or here in the header when that row is not on screen. A phone
- * shows that row only while the prompt box is expanded, and its header is too narrow for the chip, so
- * there the header gets the flame alone. It stays mounted either way, so the chip moves to the row once it appears.
- */
-export function BurnHeaderAction({ threadId, isCompactViewport }: PluginThreadHeaderActionProps): ReactNode {
+/** The native context segment owns the chip, which moves beside the prompt's context circle when that footer is visible. */
+export function BurnContextChip({ threadId }: ExperimentalThreadContextSegmentProps): ReactNode {
   const prefs = readPrefs(useSettings().values);
-  const navigate = useBbNavigate();
+  const panel = experimental_useAppPanel();
   const { answer } = useUsage(threadId, { withChildren: true });
+  const [viewport] = useState(() => window.matchMedia("(max-width: 767px), (pointer: coarse)"));
+  const [isCompactViewport, setCompactViewport] = useState(viewport.matches);
+  useEffect(() => {
+    const changed = () => setCompactViewport(viewport.matches);
+    viewport.addEventListener("change", changed);
+    return () => viewport.removeEventListener("change", changed);
+  }, [viewport]);
   const [anchor, setAnchor] = useState<HTMLSpanElement | null>(null);
   const mount = useFooterMount(prefs.chip ? anchor : null);
-  useEffect(() => registerPanelOpener(threadId, (params) => openPanelIn(navigate, params)), [threadId, navigate]);
-  const placement: Placement = mount !== null ? "footer" : isCompactViewport ? "compact" : "header";
+  useEffect(() => registerPanelOpener(threadId, (params) => openPanelIn(panel, params)), [threadId, panel]);
+  const placement: Placement = mount !== null ? "footer" : isCompactViewport ? "compact" : "context";
   const chip = prefs.chip ? <BurnChip threadId={threadId} answer={answer} placement={placement} /> : null;
   return (
     <span ref={setAnchor} className={prefs.chip && mount === null ? "inline-flex items-center" : "hidden"}>

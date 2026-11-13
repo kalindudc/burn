@@ -1,11 +1,11 @@
 // @vitest-environment jsdom
-import type { JsonValue } from "@get-bb/plugin-sdk/app";
-import { loadPluginApp, type RenderedSlot, renderSlot } from "@get-bb/plugin-sdk/testing/app";
+import type { ExperimentalThreadActionTabProps, JsonValue } from "@get-bb/plugin-sdk/app";
+import { type RenderedSlot, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { fireEvent, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { rpcContract } from "../../extensions/bb/contract.js";
+import { BurnPanel } from "../../extensions/bb/panel.js";
 import { modelRow, sampleReport } from "../helpers.js";
-import { answer, backend, CHILD, THREAD } from "./fixtures.js";
+import { answer, backend, CHILD, THREAD, type ThreadRpcContract } from "./fixtures.js";
 
 vi.mock("sonner", () => ({ toast: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn(), warning: vi.fn() }) }));
 
@@ -25,10 +25,9 @@ const FAMILY = {
 };
 
 async function renderPanel(server: ReturnType<typeof backend>, params: JsonValue | null = null, settings: Record<string, number | boolean> = {}) {
-  const app = await loadPluginApp(() => import("../../extensions/bb/app.js"));
-  const action = app.threadPanelActions[0];
-  if (!action) throw new Error("the Burn panel is not registered");
-  const slot = renderSlot<{ threadId: string; params: JsonValue | null }, typeof rpcContract>(action, { threadId: THREAD, params }, { rpc: server.rpc, settings });
+  const slot = renderSlot<ExperimentalThreadActionTabProps, ThreadRpcContract>(
+    { component: BurnPanel }, { threadId: THREAD, environment: null, params }, { rpc: server.rpc, settings },
+  );
   slots.push(slot);
   await slot.findByTestId("burn-panel");
   return slot;

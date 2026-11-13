@@ -45,6 +45,7 @@ interface MessageRow {
   data: string;
   time_created: number;
   time_updated: number;
+  type?: string;
 }
 
 interface UserPartRow {
@@ -101,9 +102,9 @@ function ratesOf(catalog: unknown, providerId: string, modelId: string): Rates |
  * estimate.
  */
 function usageOf(data: Record<string, unknown>, rates: Rates | null): Usage | null {
-  const tokens = isRecord(data.tokens) ? data.tokens : null;
-  if (tokens === null) return null;
   const failed = isRecord(data.error);
+  const tokens = isRecord(data.tokens) ? data.tokens : failed ? {} : null;
+  if (tokens === null) return null;
   const cache = isRecord(tokens.cache) ? tokens.cache : {};
   const input = num(tokens.input);
   const answered = num(tokens.output);
@@ -178,6 +179,86 @@ function stopReasonOf(data: Record<string, unknown>): "error" | "aborted" | unde
   return data.finish === "error" ? "error" : undefined;
 }
 
+/** The provider and model of a v2 assistant row, recorded under `model` rather than at the top level. */
+function v2ModelOf(data: Record<string, unknown>): { provider: string; model: string } {
+  const model = isRecord(data.model) ? data.model : {};
+  const provider = typeof model.providerID === "string" && model.providerID !== "" ? model.providerID : "unknown";
+  const id = typeof model.id === "string" && model.id !== "" ? model.id : "unknown";
+  return { provider, model: id };
+}
+
+/**
+ * What the reader needs of one session: its messages oldest first, and
+ * each user message's prompt. The old database keeps messages and parts in the
+ * `message`/`part` tables, with the role inside `data.role`; v2 keeps them in
+ * `session_message` with the role in the `type` column and splits `session` into
+ * `session_v2`. Both are read the same way below, so a reader change is a query
+ * change, not a report change.
+ */
+interface SessionReader {
+  messages(sessionId: string): MessageRow[];
+  prompts(sessionId: string): Map<string, Prompt>;
+}
+
+function v1Reader(db: DatabaseSync, warnOnce: (what: string, err: unknown) => void): SessionReader {
+  const messages = db.prepare(
+    "select id, data, time_created, time_updated from message where session_id = ? order by time_created desc, id desc limit ?",
+  );
+  // cross join keeps SQLite on the message index, so it reads the parts of user messages only, never tool output.
+  const userParts = db.prepare(
+    "select p.message_id, json_extract(p.data, '$.type') as type, json_extract(p.data, '$.text') as text, json_extract(p.data, '$.prompt') as prompt, " +
+      "json_extract(p.data, '$.synthetic') as synthetic, json_extract(p.data, '$.ignored') as ignored " +
+      "from message m cross join part p on p.message_id = m.id where m.session_id = ? and json_extract(m.data, '$.role') = 'user' order by p.time_created, p.id",
+  );
+  return {
+    messages(sessionId) {
+      const rows = (messages.all(sessionId, MESSAGES_MAX) as unknown as MessageRow[]).reverse();
+      return rows;
+    },
+    prompts(sessionId) {
+      try {
+        return promptsOf(userParts.all(sessionId) as unknown as UserPartRow[]);
+      } catch (err) {
+        warnOnce("could not read the parts of opencode's user messages, so prompts show without their text", err);
+        return new Map();
+      }
+    },
+  };
+}
+
+/**
+ * The v2 reader: `session_message` rows of `type` user, assistant or compaction, with the
+ * prompt text in the user row's `data.text` and the model under `data.model`.
+ */
+function v2Reader(db: DatabaseSync, warnOnce: (what: string, err: unknown) => void): SessionReader {
+  const messages = db.prepare(
+    "select id, case when type in ('assistant', 'compaction') and json_valid(data) then json_remove(data, '$.content') else data end as data, type, time_created, time_updated from session_message where session_id = ? and type in ('user', 'assistant', 'compaction') order by time_created desc, id desc limit ?",
+  );
+  const userRows = db.prepare(
+    "select id, data from session_message where session_id = ? and type = 'user' order by time_created, id",
+  );
+  return {
+    messages(sessionId) {
+      return (messages.all(sessionId, MESSAGES_MAX) as unknown as MessageRow[]).reverse();
+    },
+    prompts(sessionId) {
+      const prompts = new Map<string, Prompt>();
+      try {
+        for (const row of userRows.all(sessionId) as unknown as { id: string; data: string }[]) {
+          const data = parse(row.data);
+          if (data === null) continue;
+          const own = data.synthetic === true || data.ignored === true;
+          const text = typeof data.text === "string" ? collapse(data.text) : "";
+          prompts.set(row.id, { typed: !own, text: own ? "" : text });
+        }
+      } catch (err) {
+        warnOnce("could not read opencode's user messages, so prompts show without their text", err);
+      }
+      return prompts;
+    },
+  };
+}
+
 /**
  * Reads opencode's own SQLite database, where every assistant message records
  * the tokens and cost of its call, so ACP threads show up in Burn even though
@@ -220,28 +301,38 @@ export function createOpencodeDb(opts: { path: string; modelsPath?: string }): O
   }
 
   /** The thread's sessions and, below them, the subagent sessions opencode's task tool opened, marked as children. */
-  function withChildren(db: DatabaseSync, ids: readonly string[]): { id: string; child: boolean }[] {
+  function withChildren(db: DatabaseSync, layouts: { v1: boolean; v2: boolean }, ids: readonly string[]): { id: string; child: boolean }[] {
     const all = new Map<string, boolean>(ids.map((id) => [id, false]));
-    let children: ReturnType<DatabaseSync["prepare"]>;
-    try {
-      children = db.prepare("select id from session where parent_id = ?");
-    } catch (err) {
-      warnOnce("opencode's session table has no parent_id column, so subagent sessions are not counted", err);
-      return [...all].map(([id, child]) => ({ id, child }));
+    const readers: ReturnType<DatabaseSync["prepare"]>[] = [];
+    for (const [available, table] of [[layouts.v1, "session"], [layouts.v2, "session_v2"]] as const) {
+      if (!available) continue;
+      try {
+        readers.push(db.prepare(`select id from ${table} where parent_id = ?`));
+      } catch (err) {
+        warnOnce(`opencode's ${table} table has no parent_id column, so its subagent sessions are not counted`, err);
+      }
     }
     let level = [...ids];
     for (let depth = 0; depth < CHILD_DEPTH_MAX && level.length > 0; depth++) {
       const next: string[] = [];
       for (const parent of level) {
-        for (const row of children.all(parent) as unknown as { id: string }[]) {
-          if (all.has(row.id)) continue;
-          all.set(row.id, true);
-          next.push(row.id);
+        for (const children of readers) {
+          for (const row of children.all(parent) as unknown as { id: string }[]) {
+            if (all.has(row.id)) continue;
+            all.set(row.id, true);
+            next.push(row.id);
+          }
         }
       }
       level = next;
     }
     return [...all].map(([id, child]) => ({ id, child }));
+  }
+
+  /** Both layouts may coexist during migration; choose the new one per session. */
+  function schemasOf(db: DatabaseSync): { v1: boolean; v2: boolean } {
+    const has = (table: string): boolean => db.prepare("select 1 from sqlite_master where type = 'table' and name = ?").get(table) !== undefined;
+    return { v1: has("message") && has("part"), v2: has("session_message") };
   }
 
   return {
@@ -256,32 +347,34 @@ export function createOpencodeDb(opts: { path: string; modelsPath?: string }): O
         return null;
       }
       try {
-        const messages = db.prepare(
-          "select id, data, time_created, time_updated from message where session_id = ? order by time_created desc, id desc limit ?",
-        );
-        // cross join keeps SQLite on the message index, so it reads the parts of user messages only, never tool output.
-        const userParts = db.prepare(
-          "select p.message_id, json_extract(p.data, '$.type') as type, json_extract(p.data, '$.text') as text, json_extract(p.data, '$.prompt') as prompt, " +
-            "json_extract(p.data, '$.synthetic') as synthetic, json_extract(p.data, '$.ignored') as ignored " +
-            "from message m cross join part p on p.message_id = m.id where m.session_id = ? and json_extract(m.data, '$.role') = 'user' order by p.time_created, p.id",
-        );
+        const layouts = schemasOf(db);
+        if (!layouts.v1 && !layouts.v2) {
+          warnOnce("opencode's database has neither the message nor the session_message table, so its threads show no figures", new Error("unknown layout"));
+          return null;
+        }
+        const v1 = layouts.v1 ? v1Reader(db, warnOnce) : null;
+        const v2 = layouts.v2 ? v2Reader(db, warnOnce) : null;
         const entries: EntryLike[] = [];
         let at = 0;
-        for (const { id: sessionId, child } of withChildren(db, ids)) {
-          // Oldest first again: the stable sort below keeps a prompt before a call stamped in the same millisecond.
-          const rows = (messages.all(sessionId, MESSAGES_MAX) as unknown as MessageRow[]).reverse();
+        for (const { id: sessionId, child } of withChildren(db, layouts, ids)) {
+          const newer = v2?.messages(sessionId) ?? [];
+          const schema = newer.length > 0 ? "v2" : "v1";
+          const reader = schema === "v2" ? v2! : v1;
+          if (reader === null) continue;
+          const rows = schema === "v2" ? newer : reader.messages(sessionId);
           if (rows.length === 0) continue;
-          const prompts = child ? new Map<string, Prompt>() : promptsOf(userParts.all(sessionId) as unknown as UserPartRow[]);
+          const prompts = child ? new Map<string, Prompt>() : reader.prompts(sessionId);
           for (const row of rows) {
             const data = parse(row.data);
             if (data === null) continue;
             const time = isRecord(data.time) ? data.time : {};
             const created = num(time.created) || num(row.time_created);
             if (created <= 0) continue;
-            const updated = num(time.updated) || num(row.time_updated) || created;
+            const updated = Math.max(num(time.updated), num(time.completed), num(row.time_updated), created);
             at = Math.max(at, updated);
             const timestamp = new Date(created).toISOString();
-            if (data.role === "user") {
+            const role = schema === "v2" ? (row.type === "compaction" ? "assistant" : row.type) : data.role;
+            if (role === "user") {
               // A subagent's prompt comes from the parent's task call, not from the user, and
               // opencode writes some user messages itself; their calls count within the prompt before them.
               const prompt = prompts.get(row.id);
@@ -290,9 +383,13 @@ export function createOpencodeDb(opts: { path: string; modelsPath?: string }): O
               entries.push(entry);
               continue;
             }
-            if (data.role !== "assistant") continue;
-            const provider = typeof data.providerID === "string" && data.providerID !== "" ? data.providerID : "unknown";
-            const model = typeof data.modelID === "string" && data.modelID !== "" ? data.modelID : "unknown";
+            if (role !== "assistant") continue;
+            const { provider, model } = schema === "v2"
+              ? v2ModelOf(data)
+              : {
+                  provider: typeof data.providerID === "string" && data.providerID !== "" ? data.providerID : "unknown",
+                  model: typeof data.modelID === "string" && data.modelID !== "" ? data.modelID : "unknown",
+                };
             const usage = usageOf(data, ratesOf(prices(), provider, model));
             if (usage === null) continue;
             const completed = num(time.completed);
@@ -300,7 +397,7 @@ export function createOpencodeDb(opts: { path: string; modelsPath?: string }): O
             const entry = {
               type: "message",
               timestamp,
-              ...(child ? {agentId: sessionId} : {}),
+              ...(child ? { agentId: sessionId } : {}),
               message: {
                 role: "assistant",
                 provider,
@@ -316,7 +413,7 @@ export function createOpencodeDb(opts: { path: string; modelsPath?: string }): O
         if (entries.length === 0) return null;
         entries.sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
         const report = buildReport(entries, null, { timeZone });
-        report.agents = {coverage: "partial", rows: report.agents?.rows ?? []};
+        report.agents = { coverage: "partial", rows: report.agents?.rows ?? [] };
         return { report, at: at || Date.now() };
       } catch (err) {
         warnOnce("could not read opencode's database, so its threads show no figures", err);

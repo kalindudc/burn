@@ -45,7 +45,7 @@ Router aliases such as `shopify/auto-best` have no known price, so their threads
 ### Harnesses other than pi
 
 - A harness that sends bb no usage, and whose own records Burn does not read, shows nothing.
-- Call time, output speed and failed calls come from pi's session logs and opencode's database, and only from the calls they timed. Codex and Claude Code record none of them, so their figures read "—".
+- Call time and output speed come from timed calls in pi's session logs and opencode's database. Their failed calls also count when the call has no duration. Codex and Claude Code record none of these details, so their figures read "—".
 - Output speed counts the whole call, from the request to the last token, so it reads lower than a provider's quoted generation speed. Figures that Burn 0.5.3 or older recorded, such as those kept for a machine that is offline, have no speed per prompt, and a model with some untimed calls has no speed until Burn reads that thread's log again.
 - Claude Code threads read saved transcripts, including nested subagent/workflow transcripts, on the execution host. When transcripts are unavailable Burn keeps its last report or falls back to BB events with a limited-coverage notice. Claude Code is still never stopped at its budget; alerts still fire. See [coverage](usage-coverage.md).
 - Usage that bb deleted before Burn first read a thread counts as one entry: the total is right, but the split by day and model is lost. Claude Code's event fallback can lose usage when its running total restarts between turns; transcript reads recover only history still present on disk.

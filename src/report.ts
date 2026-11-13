@@ -388,11 +388,11 @@ function addDay(draft: DayDraft, { key, usage, call, ms, stopReason }: Sample): 
   if (!call) return;
   draft.calls++;
   model.calls++;
+  if (stopReason === "error") draft.failed++;
+  if (stopReason === "aborted") draft.aborted++;
   if (ms === null) return;
   const bucket = callTimeBucket(ms);
   draft.callTime[bucket] = (draft.callTime[bucket] ?? 0) + 1;
-  if (stopReason === "error") draft.failed++;
-  if (stopReason === "aborted") draft.aborted++;
 }
 
 const dayRows = (days: Map<string, DayDraft>): DayRow[] =>
@@ -595,11 +595,11 @@ export function buildReport(
     row.cacheRead += usage.cacheRead;
     row.cacheWrite += usage.cacheWrite;
     const current: TurnDraft = turn ?? (turn = newTurn(0, at, ""));
+    if (call && stopReason === "error") row.failed++;
     if (ms !== null) {
       row.timed++;
       row.ms += ms;
       row.timedOutput += usage.output;
-      if (stopReason === "error") row.failed++;
       current.ms += ms;
       current.timedOutput += usage.output;
     }

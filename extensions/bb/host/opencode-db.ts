@@ -175,7 +175,7 @@ function promptsOf(parts: readonly UserPartRow[]): Map<string, Prompt> {
 
 /** The stop reason of a call opencode recorded as failed: aborted by the user, or an error. */
 function stopReasonOf(data: Record<string, unknown>): "error" | "aborted" | undefined {
-  if (isRecord(data.error)) return data.error.name === "MessageAbortedError" ? "aborted" : "error";
+  if (isRecord(data.error)) return data.error.name === "MessageAbortedError" || data.error.type === "aborted" ? "aborted" : "error";
   return data.finish === "error" ? "error" : undefined;
 }
 
@@ -232,10 +232,10 @@ function v1Reader(db: DatabaseSync, warnOnce: (what: string, err: unknown) => vo
  */
 function v2Reader(db: DatabaseSync, warnOnce: (what: string, err: unknown) => void): SessionReader {
   const messages = db.prepare(
-    "select id, case when type in ('assistant', 'compaction') and json_valid(data) then json_remove(data, '$.content') else data end as data, type, time_created, time_updated from session_message where session_id = ? and type in ('user', 'assistant', 'compaction') order by time_created desc, id desc limit ?",
+    "select id, case when json_valid(data) then json_remove(data, '$.content', '$.files') else 'null' end as data, type, time_created, time_updated from session_message where session_id = ? and type in ('user', 'assistant', 'compaction') order by time_created desc, id desc limit ?",
   );
   const userRows = db.prepare(
-    "select id, data from session_message where session_id = ? and type = 'user' order by time_created, id",
+    "select id, case when json_valid(data) then json_extract(data, '$.text') else null end as text from session_message where session_id = ? and type = 'user' order by time_created, id",
   );
   return {
     messages(sessionId) {
@@ -244,12 +244,9 @@ function v2Reader(db: DatabaseSync, warnOnce: (what: string, err: unknown) => vo
     prompts(sessionId) {
       const prompts = new Map<string, Prompt>();
       try {
-        for (const row of userRows.all(sessionId) as unknown as { id: string; data: string }[]) {
-          const data = parse(row.data);
-          if (data === null) continue;
-          const own = data.synthetic === true || data.ignored === true;
-          const text = typeof data.text === "string" ? collapse(data.text) : "";
-          prompts.set(row.id, { typed: !own, text: own ? "" : text });
+        for (const row of userRows.all(sessionId) as unknown as { id: string; text: unknown }[]) {
+          const text = typeof row.text === "string" ? collapse(row.text) : "";
+          prompts.set(row.id, { typed: true, text });
         }
       } catch (err) {
         warnOnce("could not read opencode's user messages, so prompts show without their text", err);

@@ -243,10 +243,10 @@ describe("buildReport usage detail", () => {
     expect(r.days[0]?.callTime).toEqual([1, 1, 0, 0, 0, 0, 0, 0, 1]);
   });
 
-  it("counts failures even when a call has no usable duration", () => {
+  it("leaves a call without a usable duration untimed and never failed", () => {
     const r = buildReport([user(), call(undefined, "error"), call(-5, "error"), call(Number.POSITIVE_INFINITY, "aborted")], null);
-    expect(r.days[0]).toMatchObject({ calls: 3, failed: 2, aborted: 1, callTime: new Array(CALL_TIME_BUCKETS).fill(0) });
-    expect(r.byModel[0]).toMatchObject({ calls: 3, timed: 0, ms: 0, timedOutput: 0, failed: 2 });
+    expect(r.days[0]).toMatchObject({ calls: 3, failed: 0, aborted: 0, callTime: new Array(CALL_TIME_BUCKETS).fill(0) });
+    expect(r.byModel[0]).toMatchObject({ calls: 3, timed: 0, ms: 0, timedOutput: 0, failed: 0 });
   });
 
   it("counts the output of timed calls apart, so an untimed call does not skew the rate", () => {

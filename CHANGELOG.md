@@ -6,7 +6,7 @@ Burn follows [semantic versioning](https://semver.org). Releases from 0.4.0 on a
 
 ## Unreleased
 
-- Read OpenCode 2 session messages and child sessions, while retaining the older schema as a per-session fallback. Include compaction usage and failed calls without token counts. An untimed failed or aborted call now counts in daily failure totals.
+- Read OpenCode 2 session messages and child sessions, while retaining the older schema as a per-session fallback. Include compaction usage and failed calls without token counts.
 
 ## 0.9.4 - 2026-11-06
 

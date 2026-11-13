@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
@@ -44,16 +44,30 @@ describe("OMP session accounting", () => {
     expect(got?.coverage).not.toBe("partial");
   });
 
-  it("does not count incomplete lines or duplicate session copies twice", async () => {
+  it("refreshes the active original when a stale copy sorts first, without counting incomplete lines or copies twice", async () => {
     const s = setup();
     const path = s.write(A, [user("inspect"), assistant(1)]);
-    s.write(A, [user("inspect"), assistant(1)], "project-copy");
+    s.write(A, [user("inspect"), assistant(1)], "a-stale-copy");
     expect((await s.report(A))?.report.cost.total).toBe(1);
     const next = line(assistant(2));
     appendFileSync(path, next.slice(0, -1));
     expect((await s.report(A))?.report.cost.total).toBe(1);
     appendFileSync(path, "\n");
-    expect((await s.report(A))?.report).toMatchObject({ calls: 2, cost: { total: 3 } });
+    expect((await s.report(A))?.report).toMatchObject({ calls: 2, tokens: { input: 200, output: 100 }, cost: { total: 3 } });
+  });
+
+  it("prefers more complete history over a newer copy's mtime even when retained entries are capped", async () => {
+    const s = setup();
+    const path = s.write(A, [assistant(1), assistant(2)]);
+    const copy = s.write(A, [assistant(1), assistant(2)], "a-stale-copy");
+    const copiedAt = new Date("2030-01-01T00:00:00.000Z");
+    utimesSync(copy, copiedAt, copiedAt);
+    const sessions = createPiSessions({ dir: s.dir, layout: "omp", limits: { entriesFileMax: 2 } });
+    expect((await sessions.reportOf([A], "UTC"))?.report.cost.total).toBe(3);
+    appendFileSync(path, line(assistant(4)));
+    const activeAt = new Date("2026-10-18T12:01:00.000Z");
+    utimesSync(path, activeAt, activeAt);
+    expect((await sessions.reportOf([A], "UTC"))?.report).toMatchObject({ calls: 2, tokens: { input: 200, output: 100 }, cost: { total: 6 } });
   });
 
   it("rejects mismatched headers and symlinked project directories", async () => {

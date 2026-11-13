@@ -42,6 +42,8 @@ interface FileState {
   carry: Buffer;
   firstLine: string | null;
   header: unknown;
+  /** Complete parsed entries before trimming, so capped snapshots still compare by history length. */
+  parsedEntries: number;
   entries: EntryLike[];
 }
 
@@ -52,7 +54,7 @@ export interface PiSessions {
   sessionIdOf(path: string): string | null;
 }
 
-const fresh = (): FileState => ({ offset: 0, mtimeMs: 0, carry: Buffer.alloc(0), firstLine: null, header: null, entries: [] });
+const fresh = (): FileState => ({ offset: 0, mtimeMs: 0, carry: Buffer.alloc(0), firstLine: null, header: null, parsedEntries: 0, entries: [] });
 
 function consumeLine(state: FileState, line: string): void {
   if (line.trim() === "") return;
@@ -69,7 +71,10 @@ function consumeLine(state: FileState, line: string): void {
     return;
   }
   const entry = slimEntry(value);
-  if (entry) state.entries.push(entry);
+  if (entry) {
+    state.entries.push(entry);
+    state.parsedEntries++;
+  }
 }
 
 /** Drops the oldest entries past the per-file cap; the newest matter most for a live chip. */
@@ -228,16 +233,20 @@ export function createPiSessions(opts: { dir: string; layout?: "pi" | "omp"; lim
 
   return {
     async reportOf(sessionIds, timeZone) {
-      const found: FileState[] = [];
+      const foundById = new Map<string, FileState>();
       const ids = new Set(sessionIds.filter((id) => opts.layout !== "omp" || OMP_ID.test(id)));
-      const seen = new Set<string>();
       for (const { path, id } of await pathsOf(ids)) {
-        if (seen.has(id)) continue;
         const state = await refresh(path);
         if (!state || (opts.layout === "omp" && (state.header as { id?: unknown } | null)?.id !== id)) continue;
-        seen.add(id);
-        found.push(state);
+        const previous = foundById.get(id);
+        // A copied file may have a newer mtime but older content. Prefer complete history,
+        // using mtime only to break ties; inspect every candidate again on each refresh.
+        if (!previous || state.parsedEntries > previous.parsedEntries ||
+          (state.parsedEntries === previous.parsedEntries && state.mtimeMs > previous.mtimeMs)) {
+          foundById.set(id, state);
+        }
       }
+      const found = [...foundById.values()];
       if (found.length === 0) return null;
       const began = (s: FileState): number => {
         const at = Date.parse((s.header as { timestamp?: string } | null)?.timestamp ?? "");
@@ -250,7 +259,7 @@ export function createPiSessions(opts: { dir: string; layout?: "pi" | "omp"; lim
           return cut === null ? s.entries : s.entries.filter((e) => !(Date.parse(e.timestamp) < cut));
         });
       const report = buildReport(entries, null, { timeZone });
-      if (opts.layout === "omp" && seen.size < ids.size) {
+      if (opts.layout === "omp" && foundById.size < ids.size) {
         report.coverage = "partial";
         report.coverageNote = "Partial OMP session history: some recorded sessions are unavailable.";
       }

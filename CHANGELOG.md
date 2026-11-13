@@ -4,6 +4,12 @@ Notable changes to Burn, newest first.
 
 Burn follows [semantic versioning](https://semver.org). Releases from 0.4.0 on are tagged `vX.Y.Z` in this repository; earlier versions were not tagged. Each release's commit message has the full detail, including how the release was checked.
 
+## Unreleased
+
+- **CodeBurn inside Burn.** One navigation entry now contains **BB threads** and optional **Machine usage**. The latter retains the standalone integration's 27 reports, nine raw tables, nested snapshots, confirmed configuration changes, and leased native CSV/JSON exports. Machine-wide totals stay separate from thread accounting, budgets, discounts and price overrides.
+- **Request-driven CLI access.** CodeBurn 0.9.28+ is an optional executable on the selected connected machine. Saved visibility fails closed; mutations require short-lived, executable-bound confirmation; exports are bounded and cleaned on release or disposal. No companion, periodic collector, implicit Cursor sync or sharing service is installed or started.
+- **Current BB APIs.** Requires BB 0.49 / plugin SDK 0.6.132. The chip's non-footer fallback uses the native thread context row, and the Burn side panel uses the current action-tab API. Existing thread-spend URLs remain valid.
+
 ## 0.9.4 - 2026-11-06
 
 Burn stops asking machines that bb says are not connected, and a hidden bb window stops asking Burn for figures. A thread on a machine that bb created for it shows its cost from its first turn.

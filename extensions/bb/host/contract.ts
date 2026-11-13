@@ -1,6 +1,7 @@
 import { defineRpcContract, type ExperimentalHostSignals } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { THREAD_ID, usageReportSchema } from "../schema.js";
+import { codeburnHostMethods } from "../codeburn/contract.js";
 
 /** Threads per `reports` call: 32 reports of at most 240 KiB stay under the host's 8 MiB output limit. */
 export const HOST_BATCH = 32;
@@ -45,6 +46,7 @@ export const hostContract = defineRpcContract({
       reports: z.array(z.object({ threadId, report: usageReportSchema.nullable(), at: z.number().nullable() })),
     }),
   },
+  ...codeburnHostMethods,
 });
 
 export const hostSignals = {

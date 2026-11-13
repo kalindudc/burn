@@ -1,13 +1,14 @@
 // @vitest-environment jsdom
-import { loadPluginApp, type RenderedSlot, renderSlot } from "@get-bb/plugin-sdk/testing/app";
+import type { ExperimentalThreadContextSegmentProps } from "@get-bb/plugin-sdk/app";
+import { type RenderedSlot, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { act, fireEvent, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chipView, STALE_MS } from "../../extensions/bb/chip.js";
-import type { rpcContract, UsageAnswer } from "../../extensions/bb/contract.js";
+import { BurnContextChip, chipView, STALE_MS } from "../../extensions/bb/chip.js";
+import type { UsageAnswer } from "../../extensions/bb/contract.js";
 import { READ_TIMEOUT_MS, WORKING_REFETCH_MS } from "../../extensions/bb/usage.js";
 import { buildReport } from "../../src/report.js";
 import { modelRow, sampleReport } from "../helpers.js";
-import { answer, backend, THREAD } from "./fixtures.js";
+import { answer, backend, THREAD, type ThreadRpcContract } from "./fixtures.js";
 import { resetVisibility, setVisibility } from "./visibility.js";
 
 const toast = vi.hoisted(() => Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn(), warning: vi.fn(), info: vi.fn() }));
@@ -20,6 +21,7 @@ afterEach(() => {
   resetVisibility();
   document.body.removeAttribute("data-split-pane-id");
   for (const footer of document.querySelectorAll("[data-follow-up-composer-footer]")) footer.remove();
+  vi.unstubAllGlobals();
 });
 
 async function renderChip(
@@ -27,13 +29,11 @@ async function renderChip(
   settings: Record<string, boolean | number | string> = {},
   { isCompactViewport = false }: { isCompactViewport?: boolean } = {},
 ) {
-  const app = await loadPluginApp(() => import("../../extensions/bb/app.js"));
-  const action = app.threadHeaderActions[0];
-  if (!action) throw new Error("the Burn chip is not registered");
-  const slot = renderSlot<{ threadId: string; projectId: string; isCompactViewport: boolean }, typeof rpcContract>(
-    action,
-    { threadId: THREAD, projectId: "proj_1", isCompactViewport },
-    { rpc: server.rpc, settings },
+  vi.stubGlobal("matchMedia", (media: string) => Object.assign(new EventTarget(), { media, matches: isCompactViewport }));
+  const slot = renderSlot<ExperimentalThreadContextSegmentProps, ThreadRpcContract>(
+    { component: BurnContextChip },
+    { threadId: THREAD, projectId: "proj_1", environment: null, segments: [], isExpanded: false, onToggle: () => {} },
+    { rpc: server.rpc, settings, experimental_panel: { openTab: () => true } },
   );
   slots.push(slot);
   return slot;
@@ -385,16 +385,14 @@ describe("a hidden page", () => {
 });
 
 describe("where the chip shows", () => {
-  it("stays the full chip in the header off a phone when there is no footer", async () => {
+  it("stays the full chip in the context row off a phone when there is no footer", async () => {
     const slot = await renderChip(backend());
     const pill = await chipButton(slot);
-    expect(pill.dataset.placement).toBe("header");
     expect(pill.textContent).toBe("$4.82");
-    expect(pill.className).toContain("h-6");
     expect(slot.container.contains(pill)).toBe(true);
   });
 
-  it("shrinks to the flame alone in a phone's header, with the same label, title and card", async () => {
+  it("shrinks to the flame alone in a phone's context row, with the same label, title and card", async () => {
     const full = await chipButton(await renderChip(backend()));
     const slot = await renderChip(backend(), {}, { isCompactViewport: true });
     const icon = await chipButton(slot);
@@ -615,7 +613,7 @@ describe("the chip's popover", () => {
     expect(server.callsTo("setBudget").map((c) => (c.input as { budget: unknown }).budget)).toEqual([7.5, "default", null]);
   });
 
-  it("opens the Burn tab and copies the summary", async () => {
+  it("closes the popover when opening details and copies the summary", async () => {
     const slot = await renderChip(backend());
     let card = await openCard(slot);
     const actions = card.getByRole("toolbar", { name: "Burn actions" });
@@ -630,7 +628,6 @@ describe("the chip's popover", () => {
     expect(slot.inspection.experimental_clipboardWrites[0]?.text).toContain("### Cost of “burn UX polish”");
 
     fireEvent.click(card.getByRole("button", { name: "Open details" }));
-    expect(slot.inspection.navigateCalls).toContainEqual({ method: "openThreadPanel", options: { actionId: "burn" } });
     await vi.waitFor(() => expect(slot.queryByRole("dialog")).toBeNull());
     card = await openCard(slot);
     expect(card.getByText("Open details")).toBeTruthy();

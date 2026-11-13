@@ -4,6 +4,12 @@ Notable changes to Burn, newest first.
 
 Burn follows [semantic versioning](https://semver.org). Releases from 0.4.0 on are tagged `vX.Y.Z` in this repository; earlier versions were not tagged. Each release's commit message has the full detail, including how the release was checked.
 
+## Unreleased
+
+- Read OMP (`acp-omp`) native session logs instead of showing BB's cumulative cost with zero model calls and tokens. Recover recorded token/cache/reasoning breakdowns, request durations and per-prompt tool counts without adding the same cost twice.
+- Accept OMP title metadata before the session header, match exact session identities, exclude copied fork history, refresh during active turns and preserve saved figures when logs disappear.
+- Clarify that Calls counts model requests rather than tool executions, and include OMP in timing coverage.
+
 ## 0.9.4 - 2026-11-06
 
 Burn stops asking machines that bb says are not connected, and a hidden bb window stops asking Burn for figures. A thread on a machine that bb created for it shows its cost from its first turn.

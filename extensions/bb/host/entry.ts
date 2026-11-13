@@ -5,7 +5,7 @@ import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { CHANGED_MAX, hostContract, hostSignals } from "./contract.js";
 import { createClaudeSessions, claudeProjectsDir } from "./claude-sessions.js";
 import { createOpencodeDb, opencodeDbPath } from "./opencode-db.js";
-import { createPiSessions, sessionDir } from "./pi-sessions.js";
+import { createPiSessions, ompSessionDir, sessionDir } from "./pi-sessions.js";
 import { usageReportSchema } from "../schema.js";
 
 type Context = ExperimentalHostRpcContext<typeof hostSignals>;
@@ -35,9 +35,11 @@ export async function realDir(dir: string): Promise<string> {
  * machine bb runs it on, and signals the server as soon as a pi log changes so
  * the chip updates live.
  */
-export function createHostEntry(opts: { dir: string; opencodeDb?: string; opencodeModels?: string; watchWaitMs?: number; claudeDir?: string }) {
+export function createHostEntry(opts: { dir: string; ompDir?: string; opencodeDb?: string; opencodeModels?: string; watchWaitMs?: number; claudeDir?: string }) {
   const claude = createClaudeSessions({ dir: opts.claudeDir ?? claudeProjectsDir() });
   const sessions = createPiSessions({ dir: opts.dir });
+  const ompDir = opts.ompDir ?? ompSessionDir();
+  const omp = createPiSessions({ dir: ompDir, layout: "omp" });
   const opencode = createOpencodeDb({ path: opts.opencodeDb ?? opencodeDbPath(), modelsPath: opts.opencodeModels });
   const watchWaitMs = opts.watchWaitMs ?? WATCH_WAIT_MS;
   let watch: Promise<ExperimentalHostWatchSubscription | null> | null = null;
@@ -107,7 +109,8 @@ export function createHostEntry(opts: { dir: string; opencodeDb?: string; openco
           context.signal.throwIfAborted();
           const got = harness === "claude"
               ? await claude.reportOf(sessionIds, timeZone, { since, parentSessionIds, prices })
-              : harness === "opencode" ? await opencode.reportOf(sessionIds, timeZone) : await sessions.reportOf(sessionIds, timeZone);
+              : harness === "opencode" ? await opencode.reportOf(sessionIds, timeZone)
+              : harness === "omp" ? await omp.reportOf(sessionIds, timeZone) : await sessions.reportOf(sessionIds, timeZone);
           // Validate per report, so one malformed report is dropped instead of failing the whole batch at the RPC boundary.
           const parsed = got?.report == null ? null : usageReportSchema.safeParse(got.report);
           if (parsed !== null && !parsed.success) {
@@ -119,7 +122,7 @@ export function createHostEntry(opts: { dir: string; opencodeDb?: string; openco
           }
           reports.push({ threadId, report: parsed?.success ? parsed.data : null, at: parsed?.success ? (got?.at ?? null) : null });
         }
-        return { dir: opts.dir, reports };
+        return { dir: harness === "omp" ? ompDir : opts.dir, reports };
       },
     },
   });

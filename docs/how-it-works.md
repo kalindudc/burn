@@ -7,6 +7,7 @@ Burn has two halves: a bb plugin and a pi extension. The bb plugin alone is enou
 In bb, Burn counts every thread, whatever harness runs it.
 
 - **pi threads:** the figures come from pi's session logs, where every assistant message already carries the cost pi recorded.
+- **OMP threads (`acp-omp`):** the host reads the exact session identities from OMP's native logs in `~/.omp/agent/sessions/<project>/`. Recorded tokens, costs, model calls, reasoning tokens, request durations and per-prompt tool counts replace BB's cost-only events; they are not added to them.
 - **OpenCode threads:** the figures come from opencode's own database on the thread's machine, where every assistant message records its tokens and cost, including the calls of subagents that opencode's task tool starts.
 - **Claude Code threads:** a host reader reads the exact session identities and their recursive subagent transcript trees. Repeated content-block usage snapshots replace one another by API message ID. Logs replace event totals rather than being added to them.
 - **Other harnesses,** such as Codex: the figures come from the usage bb records for each thread, and Burn keeps its own copy of it.
@@ -15,7 +16,7 @@ When a harness passes bb its own cost, Burn uses that cost as it is. Codex and C
 
 Burn reads and keeps list prices, and applies the discounts in its settings each time it answers. So a changed discount applies at once, to past figures as well, with nothing to rebuild. See [Discounts](bb.md#discounts).
 
-## Reading pi's session logs and opencode's database
+## Reading session logs and opencode's database
 
 The bb plugin has a host entry: code that bb runs on every connected machine. It reads the session log that bb's pi bridge keeps for each pi thread on that machine, and builds the same report pi would.
 
@@ -23,9 +24,13 @@ The host entry watches the log folder, so the chip updates about a second after 
 
 For OpenCode threads, the host entry opens `opencode.db` read-only. It is in `$XDG_DATA_HOME/opencode` when that is set, and in `~/.local/share/opencode` otherwise. Burn has no watch on the database, so it reads the database again each time bb records new events for the thread, about once a second while the thread works, and again when the thread stops. A user message that opencode writes itself, such as "Continue if you have next steps" or a compaction, does not count as a prompt; its calls count within the prompt before it.
 
+OMP uses the same incremental log parser as pi, with its native project-directory layout and exact filename/header identity matching. A prepended title record is not mistaken for the session header. Copied history before a fork's creation time is excluded. BB event and status changes invalidate OMP reports, with the existing report TTL as a fallback; no extra polling service is started. Missing logs retain the last saved report, or fall back to BB events with a partial-coverage notice. Custom OMP session directories and unlinked subprocess sessions are not discovered.
+
+**Calls** means model requests, not tool executions. Tool counts are shown separately in each prompt's details. Costs recorded by a harness are usage accounting, not proof of a subscription invoice.
+
 ## Reading the usage bb records
 
-The host entry reads pi's logs and opencode's database. Claude Code also uses the host entry to read its transcripts; other harnesses need no host code. Their provider bridges, the adapters that connect an agent such as Codex to bb, already send bb a token-usage event after each model call or turn, and some send a running cost. bb tells the plugin within a second when a thread has new events, and the plugin reads them.
+The host entry reads pi and OMP logs and opencode's database. Claude Code also uses the host entry to read its transcripts; other harnesses need no host code. Their provider bridges, the adapters that connect an agent such as Codex to bb, may send token-usage events after a model call or turn, or only a running cost. A cost-only event does not supply a model-call count or token breakdown. bb tells the plugin within a second when a thread has new events, and the plugin reads them.
 
 bb deletes older usage events and keeps only the latest one for each thread. So Burn keeps its own copy of what it read in the plugin's database, and the figures survive a plugin reload.
 

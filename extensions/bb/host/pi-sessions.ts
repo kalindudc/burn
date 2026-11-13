@@ -1,4 +1,4 @@
-import { open, stat } from "node:fs/promises";
+import { open, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { buildReport, type EntryLike, forkedAt, slimEntry, type UsageReport } from "../../../src/report.js";
@@ -22,6 +22,13 @@ const EXTENSION = ".jsonl";
 export function sessionDir(home = homedir()): string {
   return join(home, ".bb", "pi-bridge-sessions");
 }
+
+/** OMP's native session tree, grouped by working directory. */
+export function ompSessionDir(home = homedir()): string {
+  return join(home, ".omp", "agent", "sessions");
+}
+
+const OMP_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 
 /** The file name stem bb's pi bridge uses for a session id (provider-pi's sanitizeSessionKey). */
 export const sessionStem = (id: string): string => id.replace(/[^A-Za-z0-9._-]/g, "_");
@@ -57,7 +64,7 @@ function consumeLine(state: FileState, line: string): void {
   } catch {
     return;
   }
-  if (first && (value as { type?: unknown } | null)?.type === "session") {
+  if (state.header === null && (value as { type?: unknown } | null)?.type === "session") {
     state.header = value;
     return;
   }
@@ -124,7 +131,7 @@ const isMissing = (err: unknown): boolean => (err as NodeJS.ErrnoException).code
  * entries, and later reads parse only the bytes pi appended. A file that shrank
  * or whose first line changed (pi rewrote it) is read again from the start.
  */
-export function createPiSessions(opts: { dir: string; limits?: Partial<Limits> }): PiSessions {
+export function createPiSessions(opts: { dir: string; layout?: "pi" | "omp"; limits?: Partial<Limits> }): PiSessions {
   const limits: Limits = {
     entriesFileMax: opts.limits?.entriesFileMax ?? ENTRIES_FILE_MAX,
     entriesTotalMax: opts.limits?.entriesTotalMax ?? ENTRIES_TOTAL_MAX,
@@ -192,12 +199,44 @@ export function createPiSessions(opts: { dir: string; limits?: Partial<Limits> }
     return run;
   }
 
+  async function pathsOf(ids: ReadonlySet<string>): Promise<{ path: string; id: string }[]> {
+    if (ids.size === 0) return [];
+    if (opts.layout !== "omp") return [...ids].map((id) => ({ path: sessionFile(opts.dir, id), id }));
+    const paths: { path: string; id: string }[] = [];
+    try {
+      const projects = await readdir(opts.dir, { withFileTypes: true });
+      for (const project of projects.sort((a, b) => a.name.localeCompare(b.name))) {
+        if (!project.isDirectory()) continue;
+        let files;
+        try {
+          files = await readdir(join(opts.dir, project.name), { withFileTypes: true });
+        } catch (err) {
+          if (isMissing(err)) continue;
+          throw err;
+        }
+        for (const file of files.sort((a, b) => a.name.localeCompare(b.name))) {
+          if (!file.isFile() || !file.name.endsWith(EXTENSION)) continue;
+          const id = file.name.slice(file.name.lastIndexOf("_") + 1, -EXTENSION.length);
+          if (ids.has(id)) paths.push({ path: join(opts.dir, project.name, file.name), id });
+        }
+      }
+    } catch (err) {
+      if (!isMissing(err)) throw err;
+    }
+    return paths;
+  }
+
   return {
     async reportOf(sessionIds, timeZone) {
       const found: FileState[] = [];
-      for (const id of new Set(sessionIds)) {
-        const state = await refresh(sessionFile(opts.dir, id));
-        if (state) found.push(state);
+      const ids = new Set(sessionIds.filter((id) => opts.layout !== "omp" || OMP_ID.test(id)));
+      const seen = new Set<string>();
+      for (const { path, id } of await pathsOf(ids)) {
+        if (seen.has(id)) continue;
+        const state = await refresh(path);
+        if (!state || (opts.layout === "omp" && (state.header as { id?: unknown } | null)?.id !== id)) continue;
+        seen.add(id);
+        found.push(state);
       }
       if (found.length === 0) return null;
       const began = (s: FileState): number => {
@@ -210,7 +249,12 @@ export function createPiSessions(opts: { dir: string; limits?: Partial<Limits> }
           const cut = forkedAt(s.header);
           return cut === null ? s.entries : s.entries.filter((e) => !(Date.parse(e.timestamp) < cut));
         });
-      return { report: buildReport(entries, null, { timeZone }), at: Math.max(...found.map((s) => s.mtimeMs)) };
+      const report = buildReport(entries, null, { timeZone });
+      if (opts.layout === "omp" && seen.size < ids.size) {
+        report.coverage = "partial";
+        report.coverageNote = "Partial OMP session history: some recorded sessions are unavailable.";
+      }
+      return { report, at: Math.max(...found.map((s) => s.mtimeMs)) };
     },
     sessionIdOf(path) {
       const name = basename(path);

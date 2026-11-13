@@ -280,12 +280,13 @@ const finiteNumber = (value: unknown): number => (typeof value === "number" && N
 function slimUsage(usage: unknown): Usage | undefined {
   if (!isRecord(usage) || !isRecord(usage.cost)) return undefined;
   const { cost } = usage;
+  const reasoning = usage.reasoning ?? usage.reasoningTokens;
   return {
     input: finiteNumber(usage.input),
     output: finiteNumber(usage.output),
     cacheRead: finiteNumber(usage.cacheRead),
     cacheWrite: finiteNumber(usage.cacheWrite),
-    reasoning: typeof usage.reasoning === "number" && Number.isFinite(usage.reasoning) ? usage.reasoning : undefined,
+    reasoning: typeof reasoning === "number" && Number.isFinite(reasoning) ? reasoning : undefined,
     cost: {
       input: finiteNumber(cost.input),
       output: finiteNumber(cost.output),
@@ -319,6 +320,8 @@ export function slimEntry(entry: unknown): EntryLike | null {
     if (role === "assistant") {
       if (stopReason !== undefined) message.stopReason = stopReason;
       if (durationMs !== undefined) message.durationMs = durationMs;
+      // OMP records request duration in milliseconds as `duration`.
+      else if (typeof entry.message.duration === "number" && Number.isFinite(entry.message.duration)) message.durationMs = entry.message.duration;
     }
     const messageUsage = slimUsage(entry.message.usage);
     if (messageUsage) message.usage = messageUsage;

@@ -247,3 +247,53 @@ describe("createOpencodeDb", () => {
     expect(await createOpencodeDb({ path: join(files.dir, "missing.db"), modelsPath: files.modelsPath }).reportOf(["ses_1"], "UTC")).toBeNull();
   });
 });
+
+describe("OpenCode 2 database", () => {
+  it("chooses each session's layout and never counts a session in both twice", async () => {
+    const files = setup([
+      { id: "old", session: "old-session", at: AT, data: assistantAt(0.001, AT) },
+      { id: "old-duplicate", session: "new-session", at: AT + 1, data: assistantAt(0.9, AT + 1) },
+    ], []);
+    const db = new DatabaseSync(files.path);
+    db.exec("create table session_v2 (id text primary key, parent_id text); create table session_message (id text primary key, session_id text, type text, time_created integer, time_updated integer, data text)");
+    const row = { ...assistantAt(0.002, AT + 2), model: { providerID: "deepseek", id: "deepseek-v4-flash" } };
+    db.prepare("insert into session_message values (?, ?, ?, ?, ?, ?)").run("new", "new-session", "assistant", AT + 2, AT + 1002, JSON.stringify(row));
+    db.close();
+    const report = (await createOpencodeDb(files).reportOf(["old-session", "new-session"], "UTC"))?.report;
+    expect(report?.calls).toBe(2);
+    expect(report?.cost.total).toBeCloseTo(0.003, 9);
+  });
+
+  it("attributes calls and child sessions to their prompts and preserves models and durations", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "burn-opencode-v2-"));
+    dirs.push(dir);
+    const path = join(dir, "opencode.db");
+    const db = new DatabaseSync(path);
+    db.exec(`create table session_v2 (id text primary key, parent_id text);
+      create table session_message (id text primary key, session_id text, type text, seq integer, time_created integer, time_updated integer, data text);
+      insert into session_v2 values ('parent', null), ('child', 'parent'), ('other', null);`);
+    const insert = db.prepare("insert into session_message values (?, ?, ?, ?, ?, ?, ?)");
+    const add = (id: string, session: string, type: string, at: number, data: object) =>
+      insert.run(id, session, type, at - AT, at, at + 1000, JSON.stringify(data));
+    const call = (at: number, model: string) => ({ model: { providerID: "openai", id: model }, time: { created: at, completed: at + 1000 }, tokens: { input: 10, output: 5, reasoning: 2, cache: { read: 3, write: 0 } }, cost: 0.01 });
+    add("u1", "parent", "user", AT, { text: "first prompt", files: [{ url: "data:image/png;base64," + "A".repeat(100_000) }] });
+    add("a1", "parent", "assistant", AT + 1, { ...call(AT + 1, "terra"), content: [{ text: "tool output" }] });
+    add("child-user", "child", "user", AT + 2, { text: "child prompt" });
+    add("child-call", "child", "assistant", AT + 3, call(AT + 3, "luna"));
+    add("synthetic", "parent", "synthetic", AT + 4, { text: "internal" });
+    add("u2", "parent", "user", AT + 5, { text: "second prompt" });
+    add("a2", "parent", "assistant", AT + 6, call(AT + 6, "terra"));
+    add("other", "other", "assistant", AT + 7, call(AT + 7, "other"));
+    add("compact", "parent", "compaction", AT + 7, call(AT + 7, "terra"));
+    add("aborted", "parent", "assistant", AT + 8, { model: { providerID: "openai", id: "terra" }, time: { created: AT + 8, completed: AT + 1008 }, finish: "error", error: { type: "aborted", message: "Step interrupted" } });
+    insert.run("bad-user", "parent", "user", 9, AT + 9, AT + 9, "{invalid");
+    insert.run("bad-assistant", "parent", "assistant", 10, AT + 10, AT + 10, "{invalid");
+    db.close();
+    const report = (await createOpencodeDb({ path, modelsPath: join(dir, "missing.json") }).reportOf(["parent"], "UTC"))?.report;
+    expect(report?.calls).toBe(5);
+    expect(report?.days).toMatchObject([{ aborted: 1 }]);
+    expect(report?.tokens).toMatchObject({ input: 40, output: 28, cacheRead: 12 });
+    expect(report?.byModel).toEqual(expect.arrayContaining([expect.objectContaining({ key: "openai/terra", calls: 4 }), expect.objectContaining({ key: "openai/luna", calls: 1 })]));
+    expect(report?.turns).toMatchObject([{ prompt: "first prompt", calls: 2 }, { prompt: "second prompt", calls: 3 }]);
+  });
+});

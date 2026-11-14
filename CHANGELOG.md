@@ -4,6 +4,10 @@ Notable changes to Burn, newest first.
 
 Burn follows [semantic versioning](https://semver.org). Releases from 0.4.0 on are tagged `vX.Y.Z` in this repository; earlier versions were not tagged. Each release's commit message has the full detail, including how the release was checked.
 
+## Unreleased
+
+- Read OpenCode 2 session messages and child sessions, while retaining the older schema as a per-session fallback. Include compaction usage and failed calls without token counts.
+
 ## 0.9.4 - 2026-11-06
 
 Burn stops asking machines that bb says are not connected, and a hidden bb window stops asking Burn for figures. A thread on a machine that bb created for it shows its cost from its first turn.

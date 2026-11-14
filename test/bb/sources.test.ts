@@ -1200,3 +1200,24 @@ it("preserves a saved Claude report when a later read has missing session identi
   expect(got?.report.coverageNote).toContain("last saved");
   await s.harness.lifecycle.dispose();
 });
+
+it("routes Kimi Code session identities to the host reader and refreshes on BB events", async () => {
+  const s = setup({ [id(1)]: { host: A, provider: "acp-kimi-code", sessions: ["session_a"] } });
+  s.costs[id(1)] = 3;
+  expect(await s.cost(id(1))).toEqual([3]);
+  expect(s.calls[0]?.input).toMatchObject({ harness: "kimi", threads: [{ sessionIds: ["session_a", id(1)] }] });
+  s.costs[id(1)] = 4;
+  await s.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: id(1), providerId: "acp-kimi-code" }), lastAssistantText: null });
+  expect(await s.cost(id(1))).toEqual([4]);
+  await s.harness.lifecycle.dispose();
+});
+
+it("falls back to BB usage if Kimi session logs are unavailable", async () => {
+  const s = setup({ [id(1)]: { host: A, provider: "acp-kimi-code" } }, { offline: [A] });
+  s.rows.push(requestEvent(id(1), "go", "ollama-cloud/kimi-k3.1-pro"), usageEvent(id(1), CODEX_1));
+  const got = (await s.source.reportsOf([id(1)])).get(id(1));
+  expect(got?.source).toBe("events");
+  expect(got?.report.coverage).toBe("partial");
+  expect(got?.report.calls).toBe(1);
+  await s.harness.lifecycle.dispose();
+});

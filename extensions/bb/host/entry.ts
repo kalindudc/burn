@@ -4,6 +4,7 @@ import type { ExperimentalHostRpcContext, ExperimentalHostWatchEvent, Experiment
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { CHANGED_MAX, hostContract, hostSignals } from "./contract.js";
 import { createClaudeSessions, claudeProjectsDir } from "./claude-sessions.js";
+import { createKimiSessions, kimiSessionsDir } from "./kimi-sessions.js";
 import { createOpencodeDb, opencodeDbPath } from "./opencode-db.js";
 import { createPiSessions, sessionDir } from "./pi-sessions.js";
 import { usageReportSchema } from "../schema.js";
@@ -35,7 +36,8 @@ export async function realDir(dir: string): Promise<string> {
  * machine bb runs it on, and signals the server as soon as a pi log changes so
  * the chip updates live.
  */
-export function createHostEntry(opts: { dir: string; opencodeDb?: string; opencodeModels?: string; watchWaitMs?: number; claudeDir?: string }) {
+export function createHostEntry(opts: { dir: string; opencodeDb?: string; opencodeModels?: string; watchWaitMs?: number; claudeDir?: string; kimiDir?: string }) {
+  const kimi = createKimiSessions({ dir: opts.kimiDir ?? kimiSessionsDir() });
   const claude = createClaudeSessions({ dir: opts.claudeDir ?? claudeProjectsDir() });
   const sessions = createPiSessions({ dir: opts.dir });
   const opencode = createOpencodeDb({ path: opts.opencodeDb ?? opencodeDbPath(), modelsPath: opts.opencodeModels });
@@ -105,7 +107,7 @@ export function createHostEntry(opts: { dir: string; opencodeDb?: string; openco
         const reports = [];
         for (const { threadId, sessionIds, since, parentSessionIds } of threads) {
           context.signal.throwIfAborted();
-          const got = harness === "claude"
+          const got = harness === "kimi" ? await kimi.reportOf(sessionIds, timeZone, { since, prices }) : harness === "claude"
               ? await claude.reportOf(sessionIds, timeZone, { since, parentSessionIds, prices })
               : harness === "opencode" ? await opencode.reportOf(sessionIds, timeZone) : await sessions.reportOf(sessionIds, timeZone);
           // Validate per report, so one malformed report is dropped instead of failing the whole batch at the RPC boundary.

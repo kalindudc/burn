@@ -72,7 +72,7 @@ export function Change({ now, before, than, none }: { now: number; before: numbe
   );
 }
 
-const TIMING_HINT = "Only pi and OpenCode record how long a call took and how it ended.";
+const TIMING_HINT = "Only pi, OMP and OpenCode record how long a call took and how it ended.";
 
 export function UsageCards({ data }: { data: SpendOutput }) {
   const { p50, p90, timed, failed } = data.callTime;
@@ -83,7 +83,7 @@ export function UsageCards({ data }: { data: SpendOutput }) {
         value={formatTokenCount(data.tokens)}
         sub={<Change now={data.tokens} before={data.previousTokens} than={previousOf(data)} none={noneText("no use", data)} />}
       />
-      <Kpi label="Calls" value={count(data.calls)} sub={`${count(data.prompts)} ${data.prompts === 1 ? "prompt" : "prompts"}`} />
+      <Kpi label="Calls" value={count(data.calls)} sub={`${count(data.prompts)} ${data.prompts === 1 ? "prompt" : "prompts"}`} hint="Model requests, not tool executions. Tool counts appear in each prompt's details." />
       <Kpi
         label="Median call"
         value={p50 === null ? "—" : formatCallTime(p50)}
@@ -260,7 +260,7 @@ export function CallTime({ data, hide }: { data: SpendOutput; hide?: ReactNode }
         </>
       )}
       <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
-        pi and OpenCode threads only: Codex and Claude Code record no call time. Failed means the provider returned an error; stopped means someone or the budget stop
+        pi, OMP and OpenCode threads only: Codex and Claude Code record no call time. Failed means the provider returned an error; stopped means someone or the budget stop
         aborted the call.
       </p>
     </section>

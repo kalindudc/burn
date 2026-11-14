@@ -261,7 +261,7 @@ export function createReportSource(
     }
     note(row.listedAt, row.status);
     const reader = harnessOf(row.providerId).reader;
-    if (reader !== "pi-log" && reader !== "opencode-db" && reader !== "claude-log") {
+    if (reader === "events") {
       return { at: now(), hostId: null, providerId: row.providerId, sessionIds: [], stems: new Set() };
     }
     const providerId = row.providerId;
@@ -514,7 +514,7 @@ export function createReportSource(
 
   async function ask(
     hostId: string,
-    harness: "pi" | "opencode" | "claude",
+    harness: "pi" | "omp" | "opencode" | "claude",
     threadIds: string[],
     answers: Map<string, LogReport | null>,
   ): Promise<void> {
@@ -550,7 +550,7 @@ export function createReportSource(
         if (failure === undefined) failures.set(hostId, { at, delay: HOST_RETRY_MS });
         else if (at - failure.at >= failure.delay) failures.set(hostId, { at, delay: Math.min(failure.delay * 2, HOST_RETRY_MAX_MS) });
         if (failure === undefined) {
-          const what = harness === "claude" ? "Claude transcripts" : harness === "pi" ? "pi session logs" : "opencode's database";
+          const what = harness === "claude" ? "Claude transcripts" : harness === "omp" ? "OMP session logs" : harness === "pi" ? "pi session logs" : "opencode's database";
           bb.log.warn(`reading ${what} on ${hostId} failed, so Burn shows the last figures it read there and asks again after a growing wait: ${message(err)}`);
         }
         return;
@@ -558,7 +558,7 @@ export function createReportSource(
       failures.delete(hostId);
       for (const { threadId, report, at } of answer.reports) {
         let got: LogReport | null = report !== null && at !== null ? { report, at, source: "log" } : null;
-        if (gen === priceGeneration && harness === "claude" && got?.report.coverage === "partial") {
+        if (gen === priceGeneration && (harness === "claude" || harness === "omp") && got?.report.coverage === "partial") {
           const kept = await lastKept(threadId);
           if (kept && kept.report.coverage !== "partial") {
             got = {
@@ -566,7 +566,7 @@ export function createReportSource(
               report: {
                 ...kept.report,
                 coverage: "partial",
-                coverageNote: "Partial latest Claude history: showing the last saved transcript report.",
+                coverageNote: `Partial latest ${harness === "omp" ? "OMP" : "Claude"} history: showing the last saved transcript report.`,
               },
             };
           }
@@ -602,10 +602,10 @@ export function createReportSource(
     hear(thread);
     const reader = harnessOf(thread.providerId).reader;
     if (reader === "events") events.invalidate(thread.id);
-    // opencode records a call when it finishes, and Burn has no watch on its database.
-    else if (reader === "opencode-db" || reader === "claude-log") {
+    // These readers have no filesystem watch; read again after the provider finishes.
+    else if (reader === "opencode-db" || reader === "claude-log" || reader === "omp-log") {
       invalidate(thread.id);
-      if (reader === "claude-log") events.invalidate(thread.id);
+      if (reader === "claude-log" || reader === "omp-log") events.invalidate(thread.id);
     }
     opts.onChange([thread.id]);
   }
@@ -623,9 +623,9 @@ export function createReportSource(
     heardStatus(thread);
   });
   for (const name of ["thread.idle", "thread.failed"] as const) bb.events.on(name, ({ thread }) => heardStatus(thread));
-  // Burn has no watch on opencode's database; bb records the thread's events, at most once a second, while opencode works.
+  // BB records events at most once a second; refresh readers without a filesystem watch while they work.
   bb.events.on("experimental_thread.events", ({ thread }) => {
-    if (!["opencode-db", "claude-log"].includes(harnessOf(thread.providerId).reader)) return;
+    if (!["opencode-db", "claude-log", "omp-log"].includes(harnessOf(thread.providerId).reader)) return;
     invalidate(thread.id);
     opts.onChange([thread.id]);
   });
@@ -647,7 +647,7 @@ export function createReportSource(
       });
       const factsInTime = await settlesBy(factsRun, until);
       // Nothing below awaits until every read is registered, so two callers never ask a host for the same thread.
-      const wanted = new Map<string, { hostId: string; harness: "pi" | "opencode" | "claude"; threadIds: string[] }>();
+      const wanted = new Map<string, { hostId: string; harness: "pi" | "omp" | "opencode" | "claude"; threadIds: string[] }>();
       for (const { threadId, hostId, providerId } of looked) {
         if (fresh(threadId)) continue;
         const reader = providerId === null ? null : harnessOf(providerId).reader;
@@ -661,7 +661,7 @@ export function createReportSource(
           continue;
         }
         if (hostId === null || !hosts.connected(hostId) || hostDown(hostId)) continue;
-        const harness = reader === "claude-log" ? "claude" : reader === "opencode-db" ? "opencode" : "pi";
+        const harness = reader === "claude-log" ? "claude" : reader === "omp-log" ? "omp" : reader === "opencode-db" ? "opencode" : "pi";
         const key = `${hostId}:${harness}`;
         const group = wanted.get(key) ?? { hostId, harness, threadIds: [] };
         group.threadIds.push(threadId);
@@ -697,8 +697,9 @@ export function createReportSource(
         }
         const best = got ?? (await lastKept(threadId));
         if (best) out.set(threadId, best);
-        else if (facts.get(threadId)?.providerId === "claude-code") {
-          const fallback = await events.reportOf(threadId, "claude-code");
+        else if (facts.get(threadId)?.providerId === "claude-code" || facts.get(threadId)?.providerId === "acp-omp") {
+          const providerId = facts.get(threadId)!.providerId!;
+          const fallback = await events.reportOf(threadId, providerId);
           if (fallback)
             out.set(threadId, {
               ...fallback,
@@ -706,7 +707,9 @@ export function createReportSource(
               report: {
                 ...fallback.report,
                 coverage: "partial",
-                coverageNote: "Limited coverage: saved history is unavailable; some subagent usage and earlier turns may be missing.",
+                coverageNote: providerId === "acp-omp"
+                  ? "Limited coverage: OMP session logs are unavailable. Only BB's recorded usage is shown; model calls, tokens and timing may be missing."
+                  : "Limited coverage: saved history is unavailable; some subagent usage and earlier turns may be missing.",
               },
             });
         }

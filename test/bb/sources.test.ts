@@ -1221,3 +1221,14 @@ it("falls back to BB usage if Kimi session logs are unavailable", async () => {
   expect(got?.report.calls).toBe(1);
   await s.harness.lifecycle.dispose();
 });
+
+it.each([
+  ["acp-dsh", "dsh"], ["acp-zcode", "zcode"], ["acp-mirror", "mirror"],
+  ["acp-minimax-code", "minimax"], ["acp-hermes-agent", "hermes"],
+])("routes %s to its host reader", async (provider, reader) => {
+  const s = setup({ [id(1)]: { host: A, provider, sessions: ["session_a"] } });
+  s.costs[id(1)] = 3;
+  expect(await s.cost(id(1))).toEqual([3]);
+  expect(s.calls[0]?.input).toMatchObject({ harness: reader, threads: [{ sessionIds: ["session_a", id(1)] }] });
+  await s.harness.lifecycle.dispose();
+});

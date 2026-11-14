@@ -16,7 +16,7 @@ const threadId = z.string().regex(THREAD_ID);
 export const hostContract = defineRpcContract({
   reports: {
     input: z.object({
-      harness: z.enum(["pi", "opencode", "claude", "kimi"]),
+      harness: z.enum(["pi", "opencode", "claude", "kimi", "dsh", "zcode", "mirror", "minimax", "hermes"]),
       /** The bb server's IANA zone, so `days` are its local days whatever the host's zone. */
       timeZone: z.string().max(100),
       /** Burn's price overrides from settings, for readers that price tokens themselves. */

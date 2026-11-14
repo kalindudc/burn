@@ -19,9 +19,14 @@ const tokens = (over: Partial<{ input: number; output: number; cacheRead: number
 });
 
 describe("price lists", () => {
-  it("match pi's list prices for every Anthropic and OpenAI Codex chat model, with no extra ids", () => {
-    expect(ANTHROPIC_PRICES).toEqual(chatCosts(ANTHROPIC_MODELS));
-    expect(OPENAI_CODEX_PRICES).toEqual(chatCosts(OPENAI_CODEX_MODELS));
+  it("match pi's list prices for every Anthropic and OpenAI Codex chat model", () => {
+    expect(ANTHROPIC_PRICES).toMatchObject(chatCosts(ANTHROPIC_MODELS));
+    expect(OPENAI_CODEX_PRICES).toMatchObject(chatCosts(OPENAI_CODEX_MODELS));
+  });
+
+  it("keep the last price of a model pi has dropped", () => {
+    expect(chatCosts(OPENAI_CODEX_MODELS)).not.toHaveProperty("gpt-5.5");
+    expect(priceOf(OPENAI_CODEX_PRICES, "gpt-5.5")).toMatchObject({ input: 5, output: 30 });
   });
 });
 

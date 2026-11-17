@@ -94,6 +94,22 @@ export const OPENAI_CODEX_PRICES: PriceTable = {
     cacheWrite: 2.5,
     tiers: [{ inputTokensAbove: 272000, input: 4, output: 15, cacheRead: 0.4, cacheWrite: 5 }],
   },
+  // OpenAI API standard prices: https://developers.openai.com/api/docs/models/gpt-6.2-sol
+  "gpt-6.2-sol": {
+    input: 2,
+    output: 10,
+    cacheRead: 0.1,
+    cacheWrite: 2.5,
+    tiers: [{ inputTokensAbove: 272000, input: 4, output: 15, cacheRead: 0.2, cacheWrite: 5 }],
+  },
+  // https://developers.openai.com/api/docs/models/gpt-6.2-astra
+  "gpt-6.2-astra": {
+    input: 8,
+    output: 40,
+    cacheRead: 0.4,
+    cacheWrite: 10,
+    tiers: [{ inputTokensAbove: 272000, input: 16, output: 60, cacheRead: 0.8, cacheWrite: 20 }],
+  },
   "gpt-6.1-sol": {
     input: 2,
     output: 10,

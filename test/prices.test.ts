@@ -79,3 +79,21 @@ describe("listCost", () => {
     expect(listCost(row, tokens({ input: 272_000 }), { tiers: true }).input).toBeCloseTo(1.36);
   });
 });
+
+describe("GPT-6.2 pricing", () => {
+  it.each([
+    ["gpt-6.2-sol", 2, 0.1, 2.5, 10],
+    ["gpt-6.2-astra", 8, 0.4, 10, 40],
+  ] as const)("prices %s at standard and long-context rates", (model, input, cacheRead, cacheWrite, output) => {
+    const price = priceOf(OPENAI_CODEX_PRICES, model)!;
+    expect(price).toMatchObject({ input, cacheRead, cacheWrite, output });
+    const atThreshold = tokens({ input: 172_000, cacheRead: 100_000, output: 1000 });
+    const overThreshold = tokens({ ...atThreshold, input: 172_001 });
+    expect(listCost(price, atThreshold, { tiers: true }).output).toBeCloseTo(output * 1000 / 1e6);
+    const cost = listCost(price, overThreshold, { tiers: true });
+    expect(cost.input).toBeCloseTo(input * 2 * 172_001 / 1e6);
+    expect(cost.cacheRead).toBeCloseTo(cacheRead * 2 * 100_000 / 1e6);
+    expect(cost.output).toBeCloseTo(output * 1.5 * 1000 / 1e6);
+    expect(listCost(price, overThreshold, { tiers: false }).input).toBeCloseTo(input * 172_001 / 1e6);
+  });
+});

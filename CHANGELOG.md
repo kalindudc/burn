@@ -4,11 +4,20 @@ Notable changes to Burn, newest first.
 
 Burn follows [semantic versioning](https://semver.org). Releases from 0.4.0 on are tagged `vX.Y.Z` in this repository; earlier versions were not tagged. Each release's commit message has the full detail, including how the release was checked.
 
-## Unreleased
+## 0.10.0 - 2026-11-18
 
-- Add opt-in **Include child threads** to each bb thread budget. It counts all descendants and workflow-owned workers for budget status and alerts; with the existing stop setting enabled, a crossing stops the running family through bb. Thread-only budgets and stopping defaults are unchanged. Shared budgets use discounted spending, survive reloads, and do not double-count native subagent usage or Burn-page totals. As with thread-only budgets, concurrent calls may overshoot, Claude Code threads are not stopped, and another prompt can continue.
+A budget in bb can now cover a whole thread family. Burn also restores usage figures for OpenCode 2 threads and prices Claude Fable 5.2 and GPT-6.1 Terra.
 
-- Read OpenCode 2 session messages and child sessions, while retaining the older schema as a per-session fallback. Include compaction usage and failed calls without token counts.
+- **Set one budget for a thread and its children.** Turn on **Include child threads** in the budget editor to count discounted spending across descendants and workflow workers without double-counting native subagent usage. Budgets remain thread-only by default. If stopping is enabled, bb stops the family's running work when the total crosses the limit, except for Claude Code threads. In-flight calls can still take spending over the limit.
+- **OpenCode 2 threads show usage again.** Burn reads the new session format, including child sessions, compaction usage, and failed calls without token counts. It falls back to the older format for sessions with no rows in the new one. ([#9](https://github.com/kalindudc/burn/issues/9), [#12](https://github.com/kalindudc/burn/pull/12))
+- **Claude Fable 5.2 and GPT-6.1 Terra now show cost.** Burn also keeps the last known prices for older Codex models that pi no longer lists. ([#15](https://github.com/kalindudc/burn/pull/15))
+- Update the Hono development dependency to 4.13.18. ([#11](https://github.com/kalindudc/burn/pull/11))
+
+### Contributors
+
+- [Jake Lancaster](https://github.com/lanjak) reported the missing OpenCode 2 usage ([#9](https://github.com/kalindudc/burn/issues/9)).
+- [Lev Kovalenko](https://github.com/levkovalenko) contributed the OpenCode 2 fix ([#12](https://github.com/kalindudc/burn/pull/12)).
+- [Nikolai Berezovskii](https://github.com/brzvsk) contributed the model pricing update ([#15](https://github.com/kalindudc/burn/pull/15)).
 
 ## 0.9.4 - 2026-11-06
 

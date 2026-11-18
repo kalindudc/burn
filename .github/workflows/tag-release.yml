@@ -1,0 +1,59 @@
+name: Tag release
+
+'on':
+  push:
+    branches: [main]
+
+jobs:
+  tag:
+    if: ${{ !github.event.created && !github.event.deleted && !github.event.forced }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Tag a new version
+        shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          previous=$(git show "$BEFORE:package.json" | jq -er '.version | strings')
+          version=$(jq -er '.version | strings' package.json)
+          if [[ "$version" == "$previous" ]]; then
+            echo "Version $version is unchanged; no tag to create."
+            exit 0
+          fi
+
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Expected a release version in X.Y.Z format in package.json."
+            exit 1
+          fi
+          if ! jq -e --arg version "$version" '.version == $version and .packages[""].version == $version' package-lock.json >/dev/null; then
+            echo "::error::package-lock.json does not match the release version $version."
+            exit 1
+          fi
+          if ! grep -qE "^## ${version//./\\.} - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no dated heading for $version."
+            exit 1
+          fi
+
+          ref="refs/tags/v$version"
+          tags=$(git ls-remote --tags origin "$ref" "$ref^{}")
+          if [[ -n "$tags" ]]; then
+            target=$(awk -v ref="$ref" '
+              $2 == ref { direct = $1 }
+              $2 == ref "^{}" { peeled = $1 }
+              END { print peeled ? peeled : direct }
+            ' <<< "$tags")
+            if [[ "$target" == "$GITHUB_SHA" ]]; then
+              echo "$ref already points to $GITHUB_SHA."
+              exit 0
+            fi
+            echo "::error::$ref already points to $target; refusing to move it."
+            exit 1
+          fi
+
+          git push --no-follow-tags origin "$GITHUB_SHA:$ref"

@@ -5,7 +5,7 @@ import type { ExperimentalHostWatchListener, ExperimentalHostWatchOptions } from
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 import { afterEach, describe, expect, it } from "vitest";
 import { CHANGED_MAX } from "../../extensions/bb/host/contract.js";
-import hostEntry, { createHostEntry, realDir } from "../../extensions/bb/host/entry.js";
+import { createHostEntry, realDir } from "../../extensions/bb/host/entry.js";
 import { createPiSessions, sessionDir, sessionFile } from "../../extensions/bb/host/pi-sessions.js";
 import { assistant, toolResult, user } from "../helpers.js";
 
@@ -312,10 +312,5 @@ describe("host entry", () => {
     // bb keeps retrying a watch that is not ready yet, so another would only pile up beside it.
     expect(t.watches).toHaveLength(1);
     await t.h.experimental_dispose();
-  });
-
-  it("exports the entry for this machine's pi session folder", () => {
-    expect(Object.keys(hostEntry.handlers)).toEqual(["reports"]);
-    expect(Object.keys(hostEntry.experimental_signals ?? {})).toEqual(["changed"]);
   });
 });

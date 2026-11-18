@@ -1,7 +1,7 @@
 import { useLayoutEffect, useState } from "react";
 import { pluginScopeAttributes } from "./lib/portal-scope.js";
 
-// bb's own markup, not an SDK contract: when it changes, the chip stays in the thread header.
+// bb's own markup, not an SDK contract: when it changes, the chip stays in the native thread context row.
 /** The row under the prompt box that ends with the context circle. */
 export const FOOTER_SELECTOR = "[data-follow-up-composer-footer]";
 /** One thread pane; a split view has several. */

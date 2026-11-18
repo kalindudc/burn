@@ -1,4 +1,4 @@
-import { type JsonValue, type PluginThreadPanelProps, useBbNavigate, useSettings } from "@get-bb/plugin-sdk/app";
+import { type ExperimentalThreadActionTabProps, type JsonValue, useBbNavigate, useSettings } from "@get-bb/plugin-sdk/app";
 import { type ReactNode, useState } from "react";
 import {
   formatAmount,
@@ -287,7 +287,7 @@ function FamilyList({ answer, report, onOpen }: { answer: UsageAnswer; report: U
 }
 
 /** The Burn tab in a thread's side panel: every turn, child threads and the budget. */
-export function BurnPanel({ threadId, params }: PluginThreadPanelProps): ReactNode {
+export function BurnPanel({ threadId, params }: ExperimentalThreadActionTabProps): ReactNode {
   const prefs = readPrefs(useSettings().values);
   const navigate = useBbNavigate();
   const [listPrice, setListPrice] = useState(false);

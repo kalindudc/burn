@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 import type { BbNavigate, PluginBrowserBbSdk, PluginThreadActionTarget } from "@get-bb/plugin-sdk/app";
+import { experimental_makePanelController } from "@get-bb/plugin-sdk/testing";
 import { type RenderedSlot, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { act } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { rpcContract } from "../../extensions/bb/contract.js";
 import { costAction, costDetail, type ThreadCosts, useThreadCosts } from "../../extensions/bb/menu.js";
 import { registerPanelOpener } from "../../extensions/bb/panel-requests.js";
-import { backend, CHILD, costRow, OTHER, THREAD } from "./fixtures.js";
+import { backend, CHILD, costRow, OTHER, THREAD, type ThreadRpcContract } from "./fixtures.js";
 import { resetVisibility, setVisibility } from "./visibility.js";
 
 vi.mock("sonner", () => ({ toast: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn(), warning: vi.fn() }) }));
@@ -21,6 +21,7 @@ const target = (id: string): PluginThreadActionTarget => ({
   id,
   projectId: "proj_1",
   parentThreadId: null,
+  parentNotifications: "auto",
   archivedAt: null,
   pinnedAt: null,
   sectionId: null,
@@ -33,13 +34,12 @@ function fakeNavigate() {
   const calls: unknown[] = [];
   const navigate = {
     toThread: (threadId: string) => calls.push(["toThread", threadId]),
-    openThreadPanel: (options: unknown) => (calls.push(["openThreadPanel", options]), true),
   } as unknown as BbNavigate;
   return { navigate, calls };
 }
 
 const item = (data: ThreadCosts, navigate: BbNavigate, id = THREAD) =>
-  costAction({ thread: target(id), data, sdk: {} as PluginBrowserBbSdk, navigate });
+  costAction({ thread: target(id), data, sdk: {} as PluginBrowserBbSdk, navigate, experimental_panel: experimental_makePanelController() });
 
 const data = (rows: ReturnType<typeof costRow>[], copy = vi.fn()): ThreadCosts => ({ rows: new Map(rows.map((r) => [r.threadId, r])), copy });
 
@@ -94,7 +94,7 @@ describe("useThreadCosts", () => {
       latest = useThreadCosts({ threadIds: ids });
       return null;
     }
-    const slot = renderSlot<{ ids: string[] }, typeof rpcContract>({ component: Probe }, { ids: initial }, { rpc: server.rpc });
+    const slot = renderSlot<{ ids: string[] }, ThreadRpcContract>({ component: Probe }, { ids: initial }, { rpc: server.rpc });
     setIds = (ids) => slot.lifecycle.rerender(<Probe ids={ids} />);
     slots.push(slot);
     return { slot, rows: () => (latest as ThreadCosts | null)?.rows ?? new Map(), setIds };

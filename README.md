@@ -14,7 +14,7 @@ Burn puts a cost pill such as `$4.82 +$0.31` in pi's footer and in bb's prompt b
 
 - A chip beside the context circle, with a card behind it that breaks the cost down and charts every call.
 - A Burn tab in the side panel that lists every prompt and adds the cost of child threads, such as minions.
-- A Burn page in bb's navigation with spend across all threads by day, project, model and harness.
+- A Burn page with **BB threads** for thread spend and optional **Machine usage** for CodeBurn's reports, settings and native exports.
 
 <table>
   <tr>
@@ -60,7 +60,7 @@ pi install "$PWD"
 
 To update, run `bb plugin update burn` and `pi update git:github.com/kalindudc/burn`. A bare `pi update` updates pi itself, not its packages.
 
-Requirements: bb 0.46 or newer. The pi extension needs pi 1.x, which provides `ctx.mode`.
+Requirements: bb 0.49 or newer. Machine usage additionally requires the standalone CodeBurn CLI 0.9.28 or newer on the selected machine; it is optional and is not installed by Burn. The pi extension needs pi 1.x, which provides `ctx.mode`.
 
 Do not install the bb plugin from npm. The npm package ships only the pi extension, and bb needs the whole repository to build the plugin.
 
@@ -68,7 +68,7 @@ Threads that are already running show their cost as soon as the bb plugin is ins
 
 ## Documentation
 
-- [Burn in bb](docs/bb.md): the chip, the card, the Burn tab, the Burn page, and settings.
+- [Burn in bb](docs/bb.md): the chip, the card, the Burn tab, thread spend, CodeBurn machine usage, and settings.
 - [Burn in pi](docs/pi.md): the pill, the `/burn` views, commands, and settings.
 - [How Burn works](docs/how-it-works.md): where the numbers come from, and how the two halves talk.
 - [Troubleshooting and limits](docs/troubleshooting.md).
@@ -94,6 +94,8 @@ The screenshots come from a sandboxed bb and pi with made-up projects and thread
 Support for OpenCode threads, which Burn reads from opencode's own database, is by [Nikolai Berezovskii](https://github.com/brzvsk) ([#1](https://github.com/kalindudc/burn/pull/1)).
 
 Subagent accounting, which reads Claude Code transcripts and separates Codex child counters, is by [Artur Karapetyan](https://github.com/architawr) ([#2](https://github.com/kalindudc/burn/pull/2)).
+
+The optional CodeBurn integration is contributed by [arbitraged-life](https://github.com/arbitraged-life), bringing their standalone BB plugin into Burn. It keeps machine-wide accounting separate from Burn's overlapping thread totals.
 
 ## License
 

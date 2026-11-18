@@ -1,4 +1,5 @@
 import type { PluginRpcTestHandlers } from "@get-bb/plugin-sdk/testing/app";
+import type { codeburnMethods } from "../../extensions/bb/codeburn/contract.js";
 import type { CostRow, rpcContract, UsageAnswer } from "../../extensions/bb/contract.js";
 import type { EventRow, Totals } from "../../extensions/bb/ledger.js";
 import { sampleReport } from "../helpers.js";
@@ -95,9 +96,10 @@ export const CODEX_1_2 = totals({
   totalTokens: 33_000,
 });
 
-type Handlers = PluginRpcTestHandlers<typeof rpcContract>;
+export type ThreadRpcContract = Omit<typeof rpcContract, keyof typeof codeburnMethods>;
+type Handlers = PluginRpcTestHandlers<ThreadRpcContract>;
 
-/** Every rpc method, answering `usage` with `usage()` and recording the calls. */
+/** Thread-usage RPC methods, answering `usage` with `usage()` and recording the calls. */
 export function backend(usage: () => UsageAnswer = () => answer(), over: Partial<Handlers> = {}) {
   const calls: { method: string; input: unknown }[] = [];
   const record =

@@ -1,18 +1,19 @@
-import type { BbNavigate, JsonValue } from "@get-bb/plugin-sdk/app";
+import type { BbNavigate, ExperimentalPanelController, JsonValue } from "@get-bb/plugin-sdk/app";
 
-/** The `threadPanelAction` id of the Burn tab. */
+/** The thread action tab id of the Burn panel. */
 export const PANEL_ACTION_ID = "burn";
 const PENDING_MS = 10_000;
 
 type Opener = (params: JsonValue | null) => boolean;
 
-// Thread menus and toasts are app-wide, but a panel opens in one thread's side panel: only that thread's chip, a
-// header action mounted in its pane, can open it there. Each mounted chip registers an opener for its thread.
+// Thread menus and toasts are app-wide, but a panel opens in one thread's side panel.
+// Each mounted context chip registers an opener bound to that thread's panel controller.
 const openers = new Map<string, Opener[]>();
 let pending: { threadId: string; params: JsonValue | null; at: number } | null = null;
 
-export function openPanelIn(navigate: BbNavigate, params: JsonValue | null): boolean {
-  return navigate.openThreadPanel(params === null ? { actionId: PANEL_ACTION_ID } : { actionId: PANEL_ACTION_ID, params });
+export function openPanelIn(panel: ExperimentalPanelController, params: JsonValue | null): boolean {
+  const tab = { id: PANEL_ACTION_ID, context: { kind: "thread" }, availability: "action" } as const;
+  return panel.openTab(params === null ? { tab } : { tab, params });
 }
 
 /** Registers the opener of a mounted chip, and runs a request that was waiting for this thread to open. */

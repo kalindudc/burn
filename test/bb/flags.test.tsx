@@ -2,9 +2,8 @@
 import { loadPluginApp, type MountedPluginContentScripts, mountPluginContentScripts, type RenderedSlot, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BurnAlert } from "../../extensions/bb/alerts.js";
-import type { rpcContract } from "../../extensions/bb/contract.js";
 import { overBudgetStatus, setRowFlags } from "../../extensions/bb/flags.js";
-import { backend, OTHER, THREAD } from "./fixtures.js";
+import { backend, OTHER, THREAD, type ThreadRpcContract } from "./fixtures.js";
 import { resetVisibility, setVisibility } from "./visibility.js";
 
 const toast = vi.hoisted(() => Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn(), warning: vi.fn(), info: vi.fn() }));
@@ -33,7 +32,7 @@ async function renderOverlay(server: ReturnType<typeof backend>, settings: Recor
   const app = await loadPluginApp(() => import("../../extensions/bb/app.js"));
   const overlay = app.appOverlays[0];
   if (!overlay) throw new Error("the Burn overlay is not registered");
-  const slot = renderSlot<Record<string, never>, typeof rpcContract>(overlay, {}, { rpc: server.rpc, settings });
+  const slot = renderSlot<Record<string, never>, ThreadRpcContract>(overlay, {}, { rpc: server.rpc, settings });
   slots.push(slot);
   return slot;
 }

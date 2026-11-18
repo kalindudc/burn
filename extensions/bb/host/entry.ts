@@ -7,6 +7,7 @@ import { createClaudeSessions, claudeProjectsDir } from "./claude-sessions.js";
 import { createOpencodeDb, opencodeDbPath } from "./opencode-db.js";
 import { createPiSessions, sessionDir } from "./pi-sessions.js";
 import { usageReportSchema } from "../schema.js";
+import { createCodeburnHostHandlers } from "../codeburn/host.js";
 
 type Context = ExperimentalHostRpcContext<typeof hostSignals>;
 
@@ -36,6 +37,7 @@ export async function realDir(dir: string): Promise<string> {
  * the chip updates live.
  */
 export function createHostEntry(opts: { dir: string; opencodeDb?: string; opencodeModels?: string; watchWaitMs?: number; claudeDir?: string }) {
+  const codeburn = createCodeburnHostHandlers();
   const claude = createClaudeSessions({ dir: opts.claudeDir ?? claudeProjectsDir() });
   const sessions = createPiSessions({ dir: opts.dir });
   const opencode = createOpencodeDb({ path: opts.opencodeDb ?? opencodeDbPath(), modelsPath: opts.opencodeModels });
@@ -100,6 +102,7 @@ export function createHostEntry(opts: { dir: string; opencodeDb?: string; openco
     contract: hostContract,
     experimental_signals: hostSignals,
     handlers: {
+      ...codeburn.handlers,
       reports: async ({ harness, threads, timeZone, prices }, context) => {
         if (harness === "pi") await ensureWatch(context);
         const reports = [];
@@ -122,6 +125,7 @@ export function createHostEntry(opts: { dir: string; opencodeDb?: string; openco
         return { dir: opts.dir, reports };
       },
     },
+    dispose: codeburn.dispose,
   });
 }
 

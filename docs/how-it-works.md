@@ -9,6 +9,8 @@ In bb, Burn counts every thread, whatever harness runs it.
 - **pi threads:** the figures come from pi's session logs, where every assistant message already carries the cost pi recorded.
 - **OpenCode threads:** the figures come from opencode's own database on the thread's machine, where every assistant message records its tokens and cost, including the calls of subagents that opencode's task tool starts.
 - **Claude Code threads:** a host reader reads the exact session identities and their recursive subagent transcript trees. Repeated content-block usage snapshots replace one another by API message ID. Logs replace event totals rather than being added to them.
+- **Kimi Code ACP threads:** the host reads per-call usage from the exact Kimi Code session and its native agent logs. For fully qualified Ollama Cloud model IDs, Burn estimates cost with Ollama's published rates and the configured price overrides. Unknown model prices and unsupported cache writes make the estimate partial.
+- **DSH, ZCode, Mirror, MiniMax Code and Hermes ACP threads:** host readers inspect the exact local session's recorded usage. Ollama Cloud prices apply only to requests with an identified Ollama provider; DeepSeek's off-peak rate follows UTC. Unknown providers, missing histories and aggregate Hermes call times are marked partial.
 - **Other harnesses,** such as Codex: the figures come from the usage bb records for each thread, and Burn keeps its own copy of it.
 
 When a harness passes bb its own cost, Burn uses that cost as it is. Codex and Claude Code pass bb their tokens but no cost. Burn prices their tokens with pi's list prices for OpenAI Codex and Anthropic models, and marks every such amount as an estimate, for example `~$1.23`. A model without a known price shows tokens instead of dollars.
@@ -42,3 +44,7 @@ The plugin's reply carries the thread's budget policy, so pi in a bb thread foll
 bb gives pi the address to report to only when it starts a pi session. So after you install the pi extension, a thread that was already running starts reporting only after it restarts. Its cost shows in bb either way, from the session log.
 
 See [Usage coverage and workflow accounting](usage-coverage.md) for source limits and the distinction between native subagents and BB workflow workers.
+
+Kimi Code logs are read from ~/.kimi-code/sessions on the thread's machine. Burn reads usage.record entries once, including native agents, and does not add nested usage snapshots. Reports refresh on BB thread events and status changes. Forks are filtered to the thread's creation time and marked partial because copied history cannot always be identified. Rates are provider-specific list-price estimates; other providers' model IDs are not assigned Ollama prices.
+
+DSH logs use compressed session frames; ZCode, Mirror, MiniMax Code, and Hermes keep usage in local databases. Burn reads those records on the host without sending conversation content to GitHub. MiniMax Code only prices messages whose recorded provider identifies Ollama; Hermes model totals do not retain individual call times, so an estimate spanning tariff periods may be imprecise.

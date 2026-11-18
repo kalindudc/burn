@@ -14,6 +14,17 @@ export interface PriceRow extends Rates {
 
 export type PriceTable = Readonly<Record<string, PriceRow>>;
 
+/** Ollama Cloud's published USD per million tokens, checked 2026-11-14.
+ * Only fully qualified Ollama model IDs are priced; the same model on another provider can cost differently.
+ * Ollama does not publish a separate cache-write rate.
+ */
+export const OLLAMA_KIMI_PRICES: PriceTable = {
+  "ollama-cloud/kimi-k3.1-pro": { input: 2, cacheRead: 0.2, output: 10, cacheWrite: 0 },
+  "ollama-cloud/kimi-k3": { input: 3, cacheRead: 0.3, output: 15, cacheWrite: 0 },
+  "ollama-cloud/kimi-k2.7-code": { input: 0.95, cacheRead: 0.19, output: 4, cacheWrite: 0 },
+  "ollama-cloud/kimi-k2.6": { input: 0.95, cacheRead: 0.16, output: 4, cacheWrite: 0 },
+};
+
 // Copied from pi-ai 1.5.2's ANTHROPIC_MODELS and OPENAI_CODEX_MODELS; test/prices.test.ts fails when pi's prices change.
 // Models pi has since dropped keep their last price, so older threads still cost what they did.
 export const ANTHROPIC_PRICES: PriceTable = {

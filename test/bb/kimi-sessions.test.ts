@@ -63,6 +63,7 @@ it("preserves tokens and marks unknown pricing, missing sessions, and fork histo
   expect(got?.report.tokens.input).toBe(200);
   expect(got?.report.coverage).toBe("partial");
   expect(got?.report.coverageNote).toContain("no known price");
+  expect(got?.report.coverageNote).toContain("history");
   const fork = await s.reader.reportOf(["session_a"], "UTC", { since: t + 1 });
   expect(fork?.report.calls).toBe(1);
   expect(fork?.report.coverage).toBe("partial");

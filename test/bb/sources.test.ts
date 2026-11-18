@@ -1219,6 +1219,8 @@ it("falls back to BB usage if Kimi session logs are unavailable", async () => {
   expect(got?.source).toBe("events");
   expect(got?.report.coverage).toBe("partial");
   expect(got?.report.calls).toBe(1);
+  expect(got?.report.cost.total).toBeGreaterThan(0);
+  expect(got?.report.estimated).toBe(true);
   await s.harness.lifecycle.dispose();
 });
 

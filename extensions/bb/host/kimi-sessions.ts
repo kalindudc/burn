@@ -1,19 +1,8 @@
 import { open, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { listCost, priceOf, type PriceOverrides, type PriceTable, withPrices } from "../../../src/prices.js";
+import { listCost, OLLAMA_KIMI_PRICES, priceOf, type PriceOverrides, withPrices } from "../../../src/prices.js";
 import { buildReport, promptExcerpt, type EntryLike, type TokenParts, type UsageReport } from "../../../src/report.js";
-
-/** Ollama Cloud's published USD per million tokens, checked 2026-11-14.
- * Only fully qualified Ollama model IDs are priced; the same model on another provider can cost differently.
- * Ollama does not publish a separate cache-write rate.
- */
-export const OLLAMA_KIMI_PRICES: PriceTable = {
-  "ollama-cloud/kimi-k3.1-pro": { input: 2, cacheRead: 0.2, output: 10, cacheWrite: 0 },
-  "ollama-cloud/kimi-k3": { input: 3, cacheRead: 0.3, output: 15, cacheWrite: 0 },
-  "ollama-cloud/kimi-k2.7-code": { input: 0.95, cacheRead: 0.19, output: 4, cacheWrite: 0 },
-  "ollama-cloud/kimi-k2.6": { input: 0.95, cacheRead: 0.16, output: 4, cacheWrite: 0 },
-};
 
 export const kimiSessionsDir = (home = homedir()): string => join(home, ".kimi-code", "sessions");
 const safeId = (id: string): boolean => /^session_[A-Za-z0-9_-]+$/.test(id);
@@ -155,12 +144,16 @@ export function createKimiSessions(opts: { dir: string }) {
     }
     if (!found || !at) return null;
     const report = buildReport(entries.sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp)), null, { timeZone });
-    partial ||= missing > 0 || unpriced;
+    const historyPartial = partial || missing > 0;
+    partial = historyPartial || unpriced;
     report.coverage = partial ? "partial" : "available";
     if (report.agents) report.agents.coverage = partial ? "partial" : "available";
-    if (partial) report.coverageNote = unpriced
-      ? "Partial estimate: some models or cache writes have no known price."
-      : "Partial Kimi Code history: some session data or inherited fork history may be unavailable.";
+    if (partial) {
+      const notes = [];
+      if (historyPartial) notes.push("Partial Kimi Code history: some session data or inherited fork history may be unavailable.");
+      if (unpriced) notes.push("Partial estimate: some models or cache writes have no known price.");
+      report.coverageNote = notes.join(" ");
+    }
     return { report, at };
   }
   return {

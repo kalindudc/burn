@@ -1,4 +1,4 @@
-import { ANTHROPIC_PRICES, OPENAI_CODEX_PRICES, type PriceOverrides, type PriceTable, withPrices } from "../../src/prices.js";
+import { ANTHROPIC_PRICES, OLLAMA_KIMI_PRICES, OPENAI_CODEX_PRICES, type PriceOverrides, type PriceTable, withPrices } from "../../src/prices.js";
 
 /** How Burn reads one bb provider's threads. */
 export interface Harness {
@@ -18,7 +18,7 @@ const HARNESSES: Readonly<Record<string, Harness>> = {
   pi: { reader: "pi-log", prices: null, cacheInInput: false, perCall: true },
   "acp-opencode": { reader: "opencode-db", prices: null, cacheInInput: false, perCall: true },
   codex: { reader: "events", prices: OPENAI_CODEX_PRICES, cacheInInput: true, perCall: true, separateChildCounters: true },
-  "acp-kimi-code": { reader: "kimi-log", prices: null, cacheInInput: false, perCall: true },
+  "acp-kimi-code": { reader: "kimi-log", prices: OLLAMA_KIMI_PRICES, cacheInInput: false, perCall: true },
   "claude-code": { reader: "claude-log", prices: ANTHROPIC_PRICES, cacheInInput: false, perCall: false },
 };
 

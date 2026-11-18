@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { harnessOf } from "../../extensions/bb/harnesses.js";
+import { harnessOf, harnessWithPrices } from "../../extensions/bb/harnesses.js";
 import { addRows, type EventRow, ledgerEntries, newLedger, splitTokens, type Totals } from "../../extensions/bb/ledger.js";
 import { isTokenOnly } from "../../src/format.js";
 import { ANTHROPIC_PRICES, OPENAI_CODEX_PRICES } from "../../src/prices.js";
@@ -265,4 +265,22 @@ it("replaces the newest counter, keeping the older ones, when it counts calls th
   const session = ledger.state.sessions.s1;
   expect(session?.total?.totalTokens).toBe(150);
   expect(session?.earlier?.map((c) => c.totalTokens)).toEqual([100]);
+});
+
+describe("a Kimi Code event fallback", () => {
+  it("prices Ollama usage with the same table and honours explicit overrides", () => {
+    const model = "ollama-cloud/kimi-k3.1-pro";
+    const total = totals({ inputTokens: 1000, totalTokens: 1000 });
+    const build = (harness: ReturnType<typeof harnessOf>) => {
+      const ledger = newLedger();
+      addRows(ledger, [request("go", model), usage(total)], harness);
+      return buildReport(ledgerEntries(ledger, "acp-kimi-code", harness), null);
+    };
+    const standard = build(harnessOf("acp-kimi-code"));
+    expect(standard.cost.total).toBeCloseTo(0.002);
+    expect(standard.estimated).toBe(true);
+    const overrides = { [model]: { input: 3, output: 0, cacheRead: 0, cacheWrite: 0 } };
+    expect(build(harnessWithPrices("acp-kimi-code", overrides)).cost.total).toBeCloseTo(0.003);
+    expect(build(harnessWithPrices("acp-kimi-code", {})).cost.total).toBeCloseTo(standard.cost.total);
+  });
 });

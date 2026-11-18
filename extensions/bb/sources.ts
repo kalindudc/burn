@@ -261,7 +261,7 @@ export function createReportSource(
     }
     note(row.listedAt, row.status);
     const reader = harnessOf(row.providerId).reader;
-    if (reader !== "pi-log" && reader !== "opencode-db" && reader !== "claude-log") {
+    if (reader !== "pi-log" && reader !== "opencode-db" && reader !== "claude-log" && reader !== "kimi-log") {
       return { at: now(), hostId: null, providerId: row.providerId, sessionIds: [], stems: new Set() };
     }
     const providerId = row.providerId;
@@ -514,13 +514,13 @@ export function createReportSource(
 
   async function ask(
     hostId: string,
-    harness: "pi" | "opencode" | "claude",
+    harness: "pi" | "opencode" | "claude" | "kimi",
     threadIds: string[],
     answers: Map<string, LogReport | null>,
   ): Promise<void> {
     const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    // Only the Claude reader prices tokens from this table; pi and opencode record their own cost.
-    const prices = harness === "claude" ? (opts.overrides?.() ?? {}) : {};
+    // Claude and Kimi price tokens themselves; pi and opencode record their own cost.
+    const prices = (harness === "claude" || harness === "kimi") ? (opts.overrides?.() ?? {}) : {};
     for (let start = 0; start < threadIds.length; start += HOST_BATCH) {
       const batch = threadIds.slice(start, start + HOST_BATCH);
       const seen = new Map(batch.map((id) => [id, versions.get(id) ?? 0]));
@@ -536,10 +536,10 @@ export function createReportSource(
             threads: batch.map((threadId) => ({
               threadId,
               sessionIds: facts.get(threadId)?.sessionIds ?? [threadId],
-              ...(harness === "claude" && facts.get(threadId)?.since !== undefined ? { since: facts.get(threadId)!.since! } : {}),
+              ...((harness === "claude" || harness === "kimi") && facts.get(threadId)?.since !== undefined ? { since: facts.get(threadId)!.since! } : {}),
               ...(harness === "claude" && facts.get(threadId)?.parentSessionIds !== undefined ? { parentSessionIds: facts.get(threadId)!.parentSessionIds! } : {}),
             })),
-            ...(harness === "claude" && Object.keys(prices).length > 0 ? { prices } : {}),
+            ...((harness === "claude" || harness === "kimi") && Object.keys(prices).length > 0 ? { prices } : {}),
           },
           { hostId, timeoutMs: HOST_TIMEOUT_MS },
         );
@@ -550,7 +550,7 @@ export function createReportSource(
         if (failure === undefined) failures.set(hostId, { at, delay: HOST_RETRY_MS });
         else if (at - failure.at >= failure.delay) failures.set(hostId, { at, delay: Math.min(failure.delay * 2, HOST_RETRY_MAX_MS) });
         if (failure === undefined) {
-          const what = harness === "claude" ? "Claude transcripts" : harness === "pi" ? "pi session logs" : "opencode's database";
+          const what = harness === "claude" ? "Claude transcripts" : harness === "kimi" ? "Kimi Code logs" : harness === "pi" ? "pi session logs" : "opencode's database";
           bb.log.warn(`reading ${what} on ${hostId} failed, so Burn shows the last figures it read there and asks again after a growing wait: ${message(err)}`);
         }
         return;
@@ -602,10 +602,10 @@ export function createReportSource(
     hear(thread);
     const reader = harnessOf(thread.providerId).reader;
     if (reader === "events") events.invalidate(thread.id);
-    // opencode records a call when it finishes, and Burn has no watch on its database.
-    else if (reader === "opencode-db" || reader === "claude-log") {
+    // These readers have no watch; reread when BB reports activity or a status change.
+    else if (reader === "opencode-db" || reader === "claude-log" || reader === "kimi-log") {
       invalidate(thread.id);
-      if (reader === "claude-log") events.invalidate(thread.id);
+      if (reader === "claude-log" || reader === "kimi-log") events.invalidate(thread.id);
     }
     opts.onChange([thread.id]);
   }
@@ -625,7 +625,7 @@ export function createReportSource(
   for (const name of ["thread.idle", "thread.failed"] as const) bb.events.on(name, ({ thread }) => heardStatus(thread));
   // Burn has no watch on opencode's database; bb records the thread's events, at most once a second, while opencode works.
   bb.events.on("experimental_thread.events", ({ thread }) => {
-    if (!["opencode-db", "claude-log"].includes(harnessOf(thread.providerId).reader)) return;
+    if (!["opencode-db", "claude-log", "kimi-log"].includes(harnessOf(thread.providerId).reader)) return;
     invalidate(thread.id);
     opts.onChange([thread.id]);
   });
@@ -647,7 +647,7 @@ export function createReportSource(
       });
       const factsInTime = await settlesBy(factsRun, until);
       // Nothing below awaits until every read is registered, so two callers never ask a host for the same thread.
-      const wanted = new Map<string, { hostId: string; harness: "pi" | "opencode" | "claude"; threadIds: string[] }>();
+      const wanted = new Map<string, { hostId: string; harness: "pi" | "opencode" | "claude" | "kimi"; threadIds: string[] }>();
       for (const { threadId, hostId, providerId } of looked) {
         if (fresh(threadId)) continue;
         const reader = providerId === null ? null : harnessOf(providerId).reader;
@@ -661,7 +661,7 @@ export function createReportSource(
           continue;
         }
         if (hostId === null || !hosts.connected(hostId) || hostDown(hostId)) continue;
-        const harness = reader === "claude-log" ? "claude" : reader === "opencode-db" ? "opencode" : "pi";
+        const harness = reader === "claude-log" ? "claude" : reader === "kimi-log" ? "kimi" : reader === "opencode-db" ? "opencode" : "pi";
         const key = `${hostId}:${harness}`;
         const group = wanted.get(key) ?? { hostId, harness, threadIds: [] };
         group.threadIds.push(threadId);
@@ -697,8 +697,9 @@ export function createReportSource(
         }
         const best = got ?? (await lastKept(threadId));
         if (best) out.set(threadId, best);
-        else if (facts.get(threadId)?.providerId === "claude-code") {
-          const fallback = await events.reportOf(threadId, "claude-code");
+        else if (facts.get(threadId)?.providerId === "claude-code" || facts.get(threadId)?.providerId === "acp-kimi-code") {
+          const provider = facts.get(threadId)!.providerId!;
+          const fallback = await events.reportOf(threadId, provider);
           if (fallback)
             out.set(threadId, {
               ...fallback,

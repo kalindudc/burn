@@ -4,6 +4,15 @@ Notable changes to Burn, newest first.
 
 Burn follows [semantic versioning](https://semver.org). Releases from 0.4.0 on are tagged `vX.Y.Z` in this repository; earlier versions were not tagged. Each release's commit message has the full detail, including how the release was checked.
 
+## 0.11.2 - 2026-11-21
+
+Burn now says when it cannot find a pi thread's session log, instead of waiting for a first model call that already happened. The Burn pi extension tells Burn where its log is, and every pull request and release is checked first.
+
+- **The chip says when Burn cannot find a session log.** When bb says a pi thread has finished a turn but its machine has no session log for it, the chip says Burn cannot find the log, and the card and the Burn tab list the folders it searched. Burn's plugin log names the machine once. A thread whose log disappeared after Burn read it keeps its last figures and says they are the last ones Burn read. Before, such threads looked as if they had not used a model yet, which is why bb's move of the pi session folder went unnoticed until 0.11.1.
+- **The Burn pi extension tells Burn where its session log is.** With each report, the extension names its session log, and Burn also looks for the thread's sessions in that folder. There it reads only regular files named for one of the thread's own sessions, and it reads them again on each report instead of watching the folder. Burn then finds logs that bb keeps elsewhere, for example with `BB_PI_BRIDGE_SESSION_DIR`. Update the extension with `pi update git:github.com/kalindudc/burn` and restart pi threads to use it.
+- **A clearer warning for an outdated pi extension.** A Burn pi extension older than 0.9.0 sends no usage token, so bb ignores its reports. The plugin log now says so and names the command that updates it.
+- **Checks run on every pull request and before each release.** A new Checks workflow runs the type check and the tests on pull requests. Tag release runs them on every push to `main` and tags a release only when they pass; if they fail, the first later commit that passes gets the tag.
+
 ## 0.11.1 - 2026-11-21
 
 pi threads in bb show their cost again. Newer bb moved pi's session logs to a new folder, and Burn now reads both the new folder and the old one.

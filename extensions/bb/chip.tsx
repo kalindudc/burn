@@ -45,6 +45,22 @@ const WAITING_TITLE = "Waiting for the first model call. Burn shows the thread's
 /** What the chip shows for an answer; pure so every state can be tested. */
 export function chipView(answer: UsageAnswer | null, opts: { now: number; fresh: boolean; chipShows: "delta" | "cost" }): ChipView {
   const report = answer?.report ?? null;
+  const missing = answer?.missingLog ?? null;
+  if (report === null && missing !== null) {
+    const where = missing.searched.length > 0 ? ` It looked in ${missing.searched.join(", ")}.` : "";
+    return {
+      tone: "waiting",
+      value: "—",
+      unit: null,
+      suffix: null,
+      progress: null,
+      running: false,
+      stale: false,
+      tokenOnly: false,
+      label: "Thread cost: Burn cannot find this thread's session log. Click for details.",
+      title: `Burn cannot find this thread's pi session log, though the thread has finished a turn.${where} Click for details.`,
+    };
+  }
   if (report === null) {
     return {
       tone: "waiting",

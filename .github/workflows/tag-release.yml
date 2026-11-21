@@ -5,7 +5,13 @@ name: Tag release
     branches: [main]
 
 jobs:
+  checks:
+    uses: ./.github/workflows/checks.yml
+    permissions:
+      contents: read
+
   tag:
+    needs: checks
     if: ${{ !github.event.created && !github.event.deleted && !github.event.forced }}
     runs-on: ubuntu-24.04
     permissions:
@@ -22,10 +28,13 @@ jobs:
         run: |
           previous=$(git show "$BEFORE:package.json" | jq -er '.version | strings')
           version=$(jq -er '.version | strings' package.json)
-          if [[ "$version" == "$previous" ]]; then
-            echo "Version $version is unchanged; no tag to create."
+          ref="refs/tags/v$version"
+          tags=$(git ls-remote --tags origin "$ref" "$ref^{}")
+          if [[ "$version" == "$previous" && -n "$tags" ]]; then
+            echo "Version $version is unchanged and already tagged; no tag to create."
             exit 0
           fi
+          # An unchanged version without a tag is a release whose checks failed; the commit that passes them gets the tag.
 
           if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::Expected a release version in X.Y.Z format in package.json."
@@ -40,8 +49,6 @@ jobs:
             exit 1
           fi
 
-          ref="refs/tags/v$version"
-          tags=$(git ls-remote --tags origin "$ref" "$ref^{}")
           if [[ -n "$tags" ]]; then
             target=$(awk -v ref="$ref" '
               $2 == ref { direct = $1 }

@@ -175,6 +175,13 @@ describe("the Burn panel", () => {
     expect(document.activeElement).not.toBe(within(plain.container).getByRole("textbox", { name: "Budget in dollars" }));
   });
 
+  it("says where Burn looked for the session log of a thread that has finished a turn", async () => {
+    const slot = await renderPanel(backend(() => answer({ report: null, reportedAt: null, missingLog: { searched: ["/data/sessions"] } })));
+    expect(slot.getByTestId("missing-log").textContent).toContain("Burn cannot find this thread's session log");
+    expect(slot.getByTestId("missing-log").textContent).toContain("/data/sessions");
+    expect(slot.queryByTestId("waiting")).toBeNull();
+  });
+
   it("explains the wait and still lets a budget be set before the first model call", async () => {
     const slot = await renderPanel(backend(() => answer({ report: null, reportedAt: null })));
     expect(slot.getByTestId("waiting").textContent).toContain("Waiting for the first model call");

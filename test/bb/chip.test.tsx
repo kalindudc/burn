@@ -97,6 +97,14 @@ describe("chipView", () => {
     expect(waiting.title).not.toMatch(/restart|\bpi\b/i);
   });
 
+  it("says Burn cannot find the session log of a thread that has finished a turn, and where it looked", () => {
+    const lost = view(answer({ report: null, reportedAt: null, missingLog: { searched: ["/data/bb/plugins/provider-pi/bridge-data/sessions", "/home/me/.bb/pi-bridge-sessions"] } }));
+    expect(lost).toMatchObject({ tone: "waiting", value: "—", suffix: null });
+    expect(lost.label).toBe("Thread cost: Burn cannot find this thread's session log. Click for details.");
+    expect(lost.title).toContain("Burn cannot find this thread's pi session log");
+    expect(lost.title).toContain("/data/bb/plugins/provider-pi/bridge-data/sessions, /home/me/.bb/pi-bridge-sessions");
+  });
+
   it("reads the same whether the figures come from pi's report or its session log", () => {
     expect(view(answer({ source: "log" })).title).toBe(view(answer()).title);
     expect(view(answer({ source: "log" })).title).not.toMatch(/restart|session log/i);

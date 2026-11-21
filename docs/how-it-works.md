@@ -18,7 +18,7 @@ Burn reads and keeps list prices, and applies the discounts in its settings each
 
 ## Reading session logs and opencode's database
 
-The bb plugin has a host entry: code that bb runs on every connected machine. It reads the session log that bb's pi bridge keeps for each pi thread on that machine, and builds the same report pi would. Newer bb keeps those logs in a different folder from older bb, so Burn reads both; see [session logs](troubleshooting.md#session-logs).
+The bb plugin has a host entry: code that bb runs on every connected machine. It reads the session log that bb's pi bridge keeps for each pi thread on that machine, and builds the same report pi would. Newer bb keeps those logs in a different folder from older bb, so Burn reads both; see [session logs](troubleshooting.md#session-logs). When a machine has no log for a pi thread that bb says has finished a turn, Burn asks bb once, says so on the chip and in the card instead of waiting for a first model call, and logs the machine once.
 
 The host entry watches the log folders, so the chip updates about a second after pi finishes a model call. It reads only the bytes pi appended since the last read. The plugin keeps the last figures each machine gave, so a thread on a machine that is offline still shows its cost. Whether a thread is working comes from bb's own thread status.
 
@@ -42,7 +42,7 @@ The pi extension's report is optional. bb ignores a pi extension's footer status
 
 The plugin gives pi an address through the `BURN_BB_URL` environment variable. pi posts a small JSON report when a run starts, after each model call, and when the run ends. Only bb's own pi reports, which runs in RPC mode; a `pi -p` started from a thread's shell does not.
 
-The figures still come from the session log. The report adds only what the log cannot know: the budget set with `/burn budget`, when pi stopped a run, and the context window.
+The figures still come from the session log. The report adds only what the log cannot know: the budget set with `/burn budget`, when pi stopped a run, and the context window. It also names the session log's path, so the plugin can read the log wherever bb keeps pi's sessions. The machine also reads that folder for the thread's own sessions, and only files there that are named for one of them and are regular files, not links. It does not watch the file's folder: each report from that thread's pi has the plugin read the log again.
 
 The plugin's reply carries the thread's budget policy, so pi in a bb thread follows bb's budget settings. A thread budget set in bb takes precedence over one set with `/burn budget`. For a thread-only budget with the pi extension installed, pi stops a run at its budget from inside pi, which is faster than stopping it through bb. An opt-in budget that includes children is enforced by bb instead: the plugin combines the reports for the whole family and stops its running threads when that total crosses the budget. The policy tells pi to leave shared-budget enforcement to bb, because pi cannot see sibling spending.
 

@@ -39,6 +39,8 @@ const EVENTS_PAGE = 100;
 const LOOKUP_TRIES = 3;
 // Room for every thread a month of use touches: a scan over more threads than a cache holds evicts each entry just before it is read again.
 const CACHE_MAX = 5000;
+/** bb event reads at once when checking whether pi threads with no log have finished a turn. */
+const MISSING_CHECKS_MAX = 4;
 /** A held report takes about 10 KB, so fewer are kept than the small per-thread facts. */
 const REPORTS_MAX = 2000;
 
@@ -63,6 +65,15 @@ export interface ReportSource {
   running(threadId: string): Promise<boolean>;
   /** How many of these threads' figures are still being read right now, for a progress line. */
   reading(threadIds: readonly string[]): number;
+  /**
+   * A pi thread that has finished a turn but whose machine found no session log for it, with the
+   * folders it looked in; null otherwise, including while Burn has not checked yet.
+   */
+  missingLog(threadId: string): { searched: string[] } | null;
+  /** Read the thread from its machine again on the next read, as after its pi named a new session log. */
+  invalidate(threadId: string): void;
+  /** The thread's log is in a folder its machine does not watch, so a report from its pi is the only news that it changed. */
+  unwatched(threadId: string): boolean;
   /** Reads these threads' details in the background, so a page over them does not start cold. */
   warm(threadIds: readonly string[]): Promise<void>;
   /** How Burn reads the thread, or null when bb could not say. */
@@ -83,6 +94,8 @@ interface Facts {
   /** null when the lookup failed. */
   providerId: string | null;
   sessionIds: string[];
+  /** bb named at least one of `sessionIds` in an identity event, rather than Burn falling back to the thread id alone. */
+  identified?: boolean;
   /** The file names the host reports changes by. */
   stems: Set<string>;
   /** The lookup found no session id of its own, only the thread-id fallback, so it is worth repeating soon. */
@@ -145,6 +158,8 @@ export function createReportSource(
     retryMs?: number;
     retryMax?: number;
     hostWaitStepsMs?: readonly number[];
+    /** The session log a pi thread's Burn pi extension last named, for the host to read first. */
+    sessionFileOf?: (threadId: string) => Promise<string | null>;
   },
 ): ReportSource {
   const now = opts.now ?? Date.now;
@@ -179,6 +194,63 @@ export function createReportSource(
   const failures = new Map<string, { at: number; delay: number }>();
   /** Hosts already logged for a pi session log this plugin may not read, so a host logs it once per load. */
   const deniedHosts = new Map<string, true>();
+  // pi threads whose machine has no log for them although they finished a turn: the folders it searched.
+  const missing = new Map<string, { hostId: string; searched: string[] }>();
+  // Whether bb says a pi thread finished a turn. A no is asked again once the thread's status changes.
+  const ran = new Map<string, boolean>();
+  const checking = new Set<string>();
+  const checkQueue: Array<() => Promise<void>> = [];
+  let checksActive = 0;
+  /** Hosts already logged for a pi thread with no log, so a host logs it once per load. */
+  const missingHosts = new Map<string, true>();
+  /** pi threads whose log is in a folder their host does not watch, which only their pi's reports say has changed. */
+  const unwatchedThreads = new Map<string, true>();
+
+  function pumpChecks(): void {
+    while (checksActive < MISSING_CHECKS_MAX && checkQueue.length > 0) {
+      const task = checkQueue.shift()!;
+      checksActive++;
+      void task().finally(() => {
+        checksActive--;
+        pumpChecks();
+      });
+    }
+  }
+
+  /** A pi thread's machine found no log: if bb says the thread finished a turn, its log is somewhere Burn does not look. */
+  function checkMissing(threadId: string, hostId: string, searched: string[]): void {
+    if (checking.has(threadId) || disposed) return;
+    checking.add(threadId);
+    checkQueue.push(async () => {
+      try {
+        let didRun = ran.get(threadId);
+        for (let tries = 0; didRun === undefined && tries < 2; tries++) {
+          const heard = heardAt.get(threadId);
+          const page = await bb.sdk.threads.events.list({ threadId, types: ["turn/completed"], order: "asc", limit: "1" });
+          if (page.length > 0) didRun = true;
+          // A status change while bb answered may be the first turn finishing: a no from before it is asked again.
+          else if (heardAt.get(threadId) === heard) didRun = false;
+          if (didRun !== undefined) remember(ran, threadId, didRun);
+        }
+        if (!didRun || disposed) return;
+        const known = missing.has(threadId);
+        remember(missing, threadId, { hostId, searched });
+        if (!missingHosts.has(hostId)) {
+          remember(missingHosts, hostId, true);
+          const where = searched.length > 0 ? searched.join(", ") : "the folders Burn knows";
+          bb.log.warn(
+            `pi thread ${threadId} on ${hostId} has finished a turn, but Burn found no session log for it in ${where}, so it shows no new cost for such threads there. If bb keeps pi's sessions elsewhere on that machine, see Burn's troubleshooting guide.`,
+          );
+        }
+        if (!known) opts.onChange([threadId]);
+      } catch (err) {
+        if (!disposed) bb.log.warn(`checking whether pi thread ${threadId} has finished a turn failed: ${message(err)}`);
+      } finally {
+        checking.delete(threadId);
+      }
+    });
+    pumpChecks();
+  }
   // The host read under way per thread, which a second caller joins instead of asking the host again, and
   // when the caller that started it stopped waiting: a joiner waits no longer, since that caller's late read signals.
   const reading = new Map<string, { run: Promise<void>; until: number }>();
@@ -291,14 +363,15 @@ export function createReportSource(
       return { at: now(), hostId: null, providerId: row.providerId, sessionIds: [], stems: new Set(), awaitingHost: statuses.get(threadId) === "active" };
     }
     // The thread id too, for a session named after the thread rather than an identity.
-    const sessionIds = [...new Set([...(await identitiesOf(threadId)), threadId])].slice(-SESSIONS_MAX);
+    const identities = await identitiesOf(threadId);
+    const sessionIds = [...new Set([...identities, threadId])].slice(-SESSIONS_MAX);
     // Only pi's bridge names its session files after these ids.
     const stems = reader === "pi-log" ? new Set(sessionIds.map(sessionStem)) : new Set<string>();
     let parentSessionIds: string[] | undefined;
     if (reader === "claude-log" && row.sourceThreadId) {
       parentSessionIds = [...new Set(await identitiesOf(row.sourceThreadId))].slice(-SESSIONS_MAX);
     }
-    return { at: now(), hostId, providerId: row.providerId, sessionIds, stems, since: row.since, parentSessionIds };
+    return { at: now(), hostId, providerId: row.providerId, sessionIds, identified: identities.length > 0, stems, since: row.since, parentSessionIds };
   }
 
   /**
@@ -525,9 +598,19 @@ export function createReportSource(
     const prices = harness === "claude" ? (opts.overrides?.() ?? {}) : {};
     for (let start = 0; start < threadIds.length; start += HOST_BATCH) {
       const batch = threadIds.slice(start, start + HOST_BATCH);
+      // Taken before anything awaits, so news that arrives meanwhile, such as a new session file, outdates this read.
       const seen = new Map(batch.map((id) => [id, versions.get(id) ?? 0]));
       const checkedAt = now();
       const gen = priceGeneration;
+      const hints = new Map<string, string>();
+      if (harness === "pi" && opts.sessionFileOf) {
+        await Promise.all(
+          batch.map(async (threadId) => {
+            const file = await opts.sessionFileOf!(threadId).catch(() => null);
+            if (file) hints.set(threadId, file);
+          }),
+        );
+      }
       let answer: Awaited<ReturnType<typeof host.call<"reports">>>;
       try {
         answer = await host.call(
@@ -540,6 +623,7 @@ export function createReportSource(
               sessionIds: facts.get(threadId)?.sessionIds ?? [threadId],
               ...(harness === "claude" && facts.get(threadId)?.since !== undefined ? { since: facts.get(threadId)!.since! } : {}),
               ...(harness === "claude" && facts.get(threadId)?.parentSessionIds !== undefined ? { parentSessionIds: facts.get(threadId)!.parentSessionIds! } : {}),
+              ...(hints.has(threadId) ? { sessionFile: hints.get(threadId)! } : {}),
             })),
             ...(harness === "claude" && Object.keys(prices).length > 0 ? { prices } : {}),
           },
@@ -558,10 +642,18 @@ export function createReportSource(
         return;
       }
       failures.delete(hostId);
-      for (const { threadId, report, at, error } of answer.reports) {
+      for (const { threadId, report, at, error, searched, unwatched } of answer.reports) {
+        const current = gen === priceGeneration && (versions.get(threadId) ?? 0) === seen.get(threadId);
         if (error !== undefined && !deniedHosts.has(hostId)) {
           remember(deniedHosts, hostId, true);
           bb.log.warn(`reading the pi session log of ${threadId} on ${hostId} failed, so Burn shows the last figures it read for threads it cannot read there: ${error}`);
+        }
+        if (harness === "pi" && current) {
+          if (unwatched) remember(unwatchedThreads, threadId, true);
+          else unwatchedThreads.delete(threadId);
+          // Only a host that says where it looked found no log, and only by a session id bb named: the thread-id fallback alone proves nothing.
+          if (report === null && error === undefined && searched !== undefined && facts.get(threadId)?.identified) checkMissing(threadId, hostId, searched);
+          else if (report !== null) missing.delete(threadId);
         }
         let got: LogReport | null = report !== null && at !== null ? { report, at, source: "log" } : null;
         if (gen === priceGeneration && got?.report.coverage === "partial") {
@@ -580,7 +672,8 @@ export function createReportSource(
           }
         }
         answers.set(threadId, got);
-        if (gen === priceGeneration && (versions.get(threadId) ?? 0) === seen.get(threadId)) remember(reports, threadId, { got, checkedAt }, REPORTS_MAX);
+        if (!current) continue;
+        remember(reports, threadId, { got, checkedAt }, REPORTS_MAX);
         // A partial pi report is shown but never saved, so the last complete one, with its days, stays to fall back on.
         if (got && !(harness === "pi" && got.report.coverage === "partial")) await save(threadId, got, gen);
       }
@@ -604,6 +697,11 @@ export function createReportSource(
   function hear(thread: { id: string; status: string }): void {
     remember(heardAt, thread.id, now());
     remember(statuses, thread.id, thread.status);
+    if (ran.get(thread.id) !== true) {
+      ran.delete(thread.id);
+      // A pi thread Burn has no log for may have just finished its first turn; read it again so the check runs.
+      if (reports.get(thread.id)?.got === null) invalidate(thread.id);
+    }
   }
 
   /** bb stores a turn's usage just before the thread goes idle, so a status change reads the thread's events again. */
@@ -640,6 +738,16 @@ export function createReportSource(
   });
 
   return {
+    missingLog(threadId) {
+      const found = missing.get(threadId);
+      return found === undefined ? null : { searched: found.searched };
+    },
+    invalidate(threadId) {
+      invalidate(threadId);
+    },
+    unwatched(threadId) {
+      return unwatchedThreads.has(threadId);
+    },
     async reportsOf(threadIds, { deadlineMs } = {}) {
       const ids = [...new Set(threadIds)];
       const answers = new Map<string, LogReport | null>();
@@ -704,7 +812,12 @@ export function createReportSource(
           if (got) out.set(threadId, got);
           return;
         }
-        const best = got ?? (await lastKept(threadId));
+        const kept = got ?? (await lastKept(threadId));
+        // The machine answered that it has no log, though the thread ran: say the figures are the last ones Burn read.
+        const lost = got === null && kept !== null && missing.has(threadId);
+        const best = lost
+          ? { ...kept, report: { ...kept.report, coverage: "partial" as const, coverageNote: "Burn can no longer find this thread's pi session log, so these are the last figures it read." } }
+          : kept;
         if (best) out.set(threadId, best);
         else if (facts.get(threadId)?.providerId === "claude-code" || facts.get(threadId)?.providerId === "acp-omp") {
           const providerId = facts.get(threadId)!.providerId!;
@@ -789,7 +902,7 @@ export function createReportSource(
       retryAttempts.delete(threadId);
       hostSteps.delete(threadId);
       hostQueue.delete(threadId);
-      for (const map of [facts, statuses, heardAt, reports, versions, saved, reading, looking, starts, owners]) map.delete(threadId);
+      for (const map of [facts, statuses, heardAt, reports, versions, saved, reading, looking, starts, owners, missing, ran, unwatchedThreads]) map.delete(threadId);
       await events.forget(threadId);
     },
     dispose() {

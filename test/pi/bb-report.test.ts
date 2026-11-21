@@ -37,6 +37,21 @@ describe("createBbReporter", () => {
     expect(body.report.cost.total).toBe(4.82);
   });
 
+  it("sends pi's session file with the report, so bb can read that log wherever bb keeps it", async () => {
+    const fetch = vi.fn(async (_url: unknown, _init?: RequestInit) => ok());
+    const reporter = createBbReporter({ env, fetch: fetch as typeof globalThis.fetch });
+    await reporter.report(sampleReport(), "rpc", "/data/bb/plugins/provider-pi/bridge-data/sessions/pi_one.jsonl");
+    await reporter.report(sampleReport(), "rpc", "/data/bb/plugins/provider-pi/bridge-data/sessions/pi_one.jsonl");
+    await reporter.report(sampleReport(), "rpc", "/elsewhere/pi_one.jsonl");
+    await reporter.report(sampleReport({ calls: 24 }), "rpc", null);
+    const bodies = fetch.mock.calls.map(([, init]) => JSON.parse((init as RequestInit).body as string));
+    expect(bodies.map((b) => b.sessionFile)).toEqual([
+      "/data/bb/plugins/provider-pi/bridge-data/sessions/pi_one.jsonl",
+      "/elsewhere/pi_one.jsonl",
+      undefined,
+    ]);
+  });
+
   it("does not resend an unchanged report but sends a changed one", async () => {
     const fetch = vi.fn(async () => ok());
     const reporter = createBbReporter({ env, fetch });

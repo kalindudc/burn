@@ -1,6 +1,6 @@
 import { defineRpcContract, type ExperimentalHostSignals } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { THREAD_ID, usageReportSchema } from "../schema.js";
+import { SESSION_FILE_MAX, THREAD_ID, usageReportSchema } from "../schema.js";
 
 /** Threads per `reports` call: 32 reports of at most 240 KiB stay under the host's 8 MiB output limit. */
 export const HOST_BATCH = 32;
@@ -33,6 +33,8 @@ export const hostContract = defineRpcContract({
             sessionIds: z.array(z.string().max(200)).max(32),
             since: z.number().nonnegative().optional(),
             parentSessionIds: z.array(z.string().max(200)).max(32).optional(),
+            /** pi's session log as the thread's pi reported it, read before the folders the host knows. */
+            sessionFile: z.string().max(SESSION_FILE_MAX).optional(),
           }),
         )
         .min(1)
@@ -41,8 +43,21 @@ export const hostContract = defineRpcContract({
     output: z.object({
       /** The folder the host reads, for the server's log lines. */
       dir: z.string(),
-      /** `at` is when the thread's newest log last changed; both are null when the host has no log for it, and `error` says why when it could not read one. */
-      reports: z.array(z.object({ threadId, report: usageReportSchema.nullable(), at: z.number().nullable(), error: z.string().max(500).optional() })),
+      /**
+       * `at` is when the thread's newest log last changed; both are null when the host has no log for it, and `error` says why when it could not read one.
+       * `searched` names the folders a pi thread's log was looked for in, when none held it.
+       */
+      reports: z.array(
+        z.object({
+          threadId,
+          report: usageReportSchema.nullable(),
+          at: z.number().nullable(),
+          error: z.string().max(500).optional(),
+          searched: z.array(z.string().max(SESSION_FILE_MAX)).max(16).optional(),
+          /** The log may be in a folder the host does not watch, so only the thread's pi reports its changes. */
+          unwatched: z.boolean().optional(),
+        }),
+      ),
     }),
   },
 });

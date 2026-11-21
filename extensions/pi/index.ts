@@ -106,7 +106,7 @@ export function createBurn(deps: BurnDeps = {}): (pi: ExtensionAPI) => void {
         panel.component.update(snap.report, snap.policy.budget);
         panel.tui.requestRender();
       }
-      void reporter.report(snap.report, ctx.mode);
+      void reporter.report(snap.report, ctx.mode, ctx.sessionManager.getSessionFile() ?? null);
     }
 
     /** The only place Burn may stop a run: with stop at budget on, for the run that crosses it. */

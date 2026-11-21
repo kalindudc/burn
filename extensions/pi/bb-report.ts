@@ -6,7 +6,8 @@ const THREAD_ID = /^thr_[0-9a-z]{6,40}$/;
 const TIMEOUT_MS = 500;
 
 export interface BbReporter {
-  report(report: UsageReport, mode: string): Promise<void>;
+  /** `sessionFile` is pi's session log, so bb can read it wherever bb keeps pi's sessions. */
+  report(report: UsageReport, mode: string, sessionFile?: string | null): Promise<void>;
   /** bb's latest budget policy for this thread, or null before bb has sent one. */
   policy(): BudgetPolicy | null;
 }
@@ -27,18 +28,18 @@ export function createBbReporter(opts: {
   let policy: BudgetPolicy | null = null;
   return {
     policy: () => policy,
-    async report(report, mode) {
+    async report(report, mode, sessionFile = null) {
       const url = env.BURN_BB_URL ?? "";
       const threadId = env.BB_THREAD_ID ?? "";
       const token = env.BURN_BB_TOKEN ?? "";
       if (mode !== "rpc" || !/^https?:\/\//.test(url) || !THREAD_ID.test(threadId)) return;
-      const key = JSON.stringify(report);
+      const key = JSON.stringify([report, sessionFile]);
       if (key === lastSent) return;
       try {
         const res = await send(url, {
           method: "POST",
           headers: { "content-type": "application/json", ...(token === "" ? {} : { "x-burn-token": token }) },
-          body: JSON.stringify({ threadId, sentAt: Date.now(), report }),
+          body: JSON.stringify({ threadId, sentAt: Date.now(), report, ...(sessionFile ? { sessionFile } : {}) }),
           signal: AbortSignal.timeout(TIMEOUT_MS),
         });
         if (!res.ok) {

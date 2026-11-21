@@ -5,7 +5,7 @@ import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { CHANGED_MAX, hostContract, hostSignals } from "./contract.js";
 import { createClaudeSessions, claudeProjectsDir } from "./claude-sessions.js";
 import { createOpencodeDb, opencodeDbPath } from "./opencode-db.js";
-import { createPiSessions, isAccessDenied, ompSessionDir, piSessionDirs, type PiSessions } from "./pi-sessions.js";
+import { createPiSessions, hintedDir, isAccessDenied, ompSessionDir, piSessionDirs, type PiSessions } from "./pi-sessions.js";
 import { usageReportSchema } from "../schema.js";
 
 type Context = ExperimentalHostRpcContext<typeof hostSignals>;
@@ -137,20 +137,36 @@ export function createHostEntry(opts: {
     experimental_signals: hostSignals,
     handlers: {
       reports: async ({ harness, threads, timeZone, prices }, context) => {
-        if (harness === "pi") await ensureWatches(context);
+        // The folder a thread's pi named is read for that thread's sessions only, and never watched: the thread is
+        // `unwatched`, so each report from its pi reads it again, including before pi has written its log there.
+        const hints = new Map<string, string>();
+        if (harness === "pi") {
+          await ensureWatches(context);
+          const { dirs } = piOf(context);
+          for (const { threadId, sessionIds, sessionFile } of threads) {
+            const dir = hintedDir(sessionFile, sessionIds);
+            if (dir !== null && !dirs.includes(dir)) hints.set(threadId, dir);
+          }
+        }
         const reports = [];
         for (const { threadId, sessionIds, since, parentSessionIds } of threads) {
           context.signal.throwIfAborted();
+          const elsewhere = hints.get(threadId);
+          const unwatched = elsewhere === undefined ? {} : { unwatched: true };
           let got;
           try {
             got = harness === "claude"
                 ? await claude.reportOf(sessionIds, timeZone, { since, parentSessionIds, prices })
                 : harness === "opencode" ? await opencode.reportOf(sessionIds, timeZone)
-                : harness === "omp" ? await omp.reportOf(sessionIds, timeZone) : await piOf(context).sessions.reportOf(sessionIds, timeZone);
+                : harness === "omp" ? await omp.reportOf(sessionIds, timeZone) : await piOf(context).sessions.reportOf(sessionIds, timeZone, elsewhere);
           } catch (err) {
             // A log this worker may not read costs only its own thread, which keeps its last figures.
             if (harness !== "pi" || !isAccessDenied(err)) throw err;
-            reports.push({ threadId, report: null, at: null, error: String((err as Error).message ?? err).slice(0, 500) });
+            reports.push({ threadId, report: null, at: null, error: String((err as Error).message ?? err).slice(0, 500), ...unwatched });
+            continue;
+          }
+          if (harness === "pi" && got === null) {
+            reports.push({ threadId, report: null, at: null, searched: [...new Set([...(elsewhere === undefined ? [] : [elsewhere]), ...piOf(context).dirs])], ...unwatched });
             continue;
           }
           // Validate per report, so one malformed report is dropped instead of failing the whole batch at the RPC boundary.
@@ -162,7 +178,7 @@ export function createHostEntry(opts: {
               console.warn(`[burn] dropping an invalid ${harness} report for ${threadId}: ${parsed.error.issues[0]?.message ?? "invalid report"}`);
             }
           }
-          reports.push({ threadId, report: parsed?.success ? parsed.data : null, at: parsed?.success ? (got?.at ?? null) : null });
+          reports.push({ threadId, report: parsed?.success ? parsed.data : null, at: parsed?.success ? (got?.at ?? null) : null, ...unwatched });
         }
         return { dir: harness === "omp" ? ompDir : piOf(context).dirs.join(", "), reports };
       },

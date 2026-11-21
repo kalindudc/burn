@@ -16,7 +16,7 @@ import {
 import { outputPerSec, reportOutputPerSec, type TurnRow, type UsageReport } from "../../src/report.js";
 import { AgentRows, CostBreakdown, agentLabel } from "./agents.js";
 import { BudgetEditor } from "./budget-editor.js";
-import { BudgetStatus, CopyAction, EstimatedNote, Label, Models, StoppedNotice, WaitingNotice, WhereItWent } from "./card.js";
+import { BudgetStatus, CopyAction, EstimatedNote, Label, MissingLogNotice, Models, StoppedNotice, WaitingNotice, WhereItWent } from "./card.js";
 import { MiniBars } from "./charts.js";
 import type { Family, UsageAnswer } from "./contract.js";
 import { childUsageCount } from "./family.js";
@@ -316,7 +316,11 @@ export function BurnPanel({ threadId, params }: PluginThreadPanelProps): ReactNo
   return (
     <div className="flex flex-col gap-4 text-xs" data-testid="burn-panel">
       {prices}
-      {report === null ? <WaitingNotice /> : <Kpis answer={answer} report={report} atList={atList} />}
+      {report === null ? (
+        answer.missingLog ? <MissingLogNotice searched={answer.missingLog.searched} /> : <WaitingNotice />
+      ) : (
+        <Kpis answer={answer} report={report} atList={atList} />
+      )}
       {report?.coverageNote ? <p className="text-xs text-warning-text">{report.coverageNote}</p> : null}
       {report?.estimated ? <EstimatedNote /> : null}
       {report?.stoppedAt != null ? <StoppedNotice stoppedAt={report.stoppedAt} budget={budget} /> : null}

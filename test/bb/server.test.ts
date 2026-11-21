@@ -9,7 +9,7 @@ import * as spendServer from "../../extensions/bb/spend/server.js";
 import type { EntryLike, UsageReport } from "../../src/report.js";
 import { buildReport, dayKey } from "../../src/report.js";
 import { assistant, dayRow, sampleReport, toolResult, user } from "../helpers.js";
-import { CODEX_1, CODEX_1_2, CODEX_2, listEvents, requestEvent, totals, usageEvent } from "./fixtures.js";
+import { CODEX_1, CODEX_1_2, CODEX_2, event, listEvents, requestEvent, totals, usageEvent } from "./fixtures.js";
 
 const THREAD = "thr_aaaaaaaa";
 const CHILD = "thr_cccccccc";
@@ -41,6 +41,8 @@ type Options = {
   /** Stored pi reports, as a previous plugin load left them. */
   reports?: Record<string, unknown>;
   budgets?: Record<string, { budget: number; includeChildren?: boolean }>;
+  /** Threads whose log the host reads from a folder it does not watch. */
+  unwatched?: string[];
 };
 
 const LOG_MTIME = 1_700_000_000_000;
@@ -53,6 +55,8 @@ async function setup(opts: Options = {}) {
   /** When each thread's log last changed, as the host reports it; LOG_MTIME when not given. */
   const mtimes: Record<string, number> = {};
   const hostAsked: string[] = [];
+  const hostThreads: { threadId: string; sessionFile?: string }[] = [];
+  const unwatched = new Set<string>(opts.unwatched ?? []);
   let gate: Promise<void> | null = null;
   const { bb, harness } = createFakePluginHost({
     pluginId: "burn",
@@ -110,14 +114,15 @@ async function setup(opts: Options = {}) {
     experimental_callHostRpc: async ({ input }) => {
       const { threads, timeZone } = input as { threads: { threadId: string }[]; timeZone: string };
       hostAsked.push(...threads.map((t) => t.threadId));
+      hostThreads.push(...threads);
       if (gate) await gate;
       return {
         dir: "/home/me/.bb/pi-bridge-sessions",
         reports: threads.map(({ threadId }) => {
           const entries = logs[threadId];
           return entries
-            ? { threadId, report: buildReport(entries as EntryLike[], null, { timeZone }), at: mtimes[threadId] ?? LOG_MTIME }
-            : { threadId, report: null, at: null };
+            ? { threadId, report: buildReport(entries as EntryLike[], null, { timeZone }), at: mtimes[threadId] ?? LOG_MTIME, ...(unwatched.has(threadId) ? { unwatched: true } : {}) }
+            : { threadId, report: null, at: null, searched: ["/home/me/.bb/pi-bridge-sessions"] };
         }),
       };
     },
@@ -165,7 +170,7 @@ async function setup(opts: Options = {}) {
     });
     return release;
   };
-  return { bb, harness, post, rpc, usage, signals, alerts, logs, mtimes, statuses, spend, stops, record, hostAsked: () => [...hostAsked], hold };
+  return { bb, harness, post, rpc, usage, signals, alerts, logs, mtimes, statuses, spend, stops, record, rows, hostAsked: () => [...hostAsked], hostThreads: () => [...hostThreads], hold };
 }
 
 const envelope = (sentAt: number, over: Partial<UsageReport> = {}, threadId = THREAD) => ({ threadId, sentAt, report: sampleReport(over) });
@@ -279,6 +284,50 @@ describe("POST /usage", () => {
     expect(got.report).toEqual(report);
     expect(typeof got.reportedAt).toBe("number");
     expect(s.signals()).toEqual([{ channel: "usage", payload: { threadId: THREAD } }]);
+  });
+
+  it("keeps the session file pi names, gives it to the host, and reads the thread again when it changes", async () => {
+    const s = await setup();
+    const file = "/custom/sessions/pi_thr_aaaaaaaa.jsonl";
+    expect((await s.post({ ...envelope(1), sessionFile: file })).status).toBe(200);
+    expect(await s.bb.storage.kv.get(`report:${THREAD}`)).toMatchObject({ sessionFile: file });
+    await s.usage();
+    await vi.waitFor(() => expect(s.hostThreads().filter((t) => t.threadId === THREAD).at(-1)?.sessionFile).toBe(file));
+    const asked = s.hostAsked().length;
+    await s.post({ ...envelope(2), sessionFile: "/other/pi_thr_aaaaaaaa.jsonl" });
+    await s.usage();
+    await vi.waitFor(() => expect(s.hostAsked().length).toBeGreaterThan(asked));
+    expect(s.hostThreads().at(-1)?.sessionFile).toBe("/other/pi_thr_aaaaaaaa.jsonl");
+  });
+
+  it("reads a thread whose log its machine does not watch again on each report from its pi", async () => {
+    const s = await setup({ logs: { [THREAD]: [user(), assistant(1)] }, unwatched: [THREAD] });
+    const file = "/custom/sessions/pi_thr_aaaaaaaa.jsonl";
+    await s.post({ ...envelope(1), sessionFile: file });
+    await vi.waitFor(async () => expect((await s.usage()).report.cost.total).toBeCloseTo(1));
+    s.logs[THREAD] = [user(), assistant(1), user(), assistant(2)];
+    await s.post({ ...envelope(2), sessionFile: file });
+    await vi.waitFor(async () => expect((await s.usage()).report.cost.total).toBeCloseTo(3));
+  });
+
+  it("says when a pi thread that finished a turn has no session log, and where its machine looked, but not before it ran", async () => {
+    const s = await setup({ providers: { [THREAD]: "pi", [CHILD]: "pi" } });
+    await s.usage(CHILD);
+    s.rows.push(event(THREAD, "turn/completed", {}));
+    await vi.waitFor(async () => expect((await s.usage()).missingLog).toEqual({ searched: ["/home/me/.bb/pi-bridge-sessions"] }));
+    expect((await s.usage()).report).toBeNull();
+    expect((await s.usage(CHILD)).missingLog).toBeNull();
+  });
+
+  it("names the likely causes when a pi session reports without a token, once", async () => {
+    const s = await setup();
+    const send = () =>
+      s.harness.behavior.fetchHttp("POST", "/usage", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(envelope(1)) });
+    expect((await send()).status).toBe(401);
+    expect((await send()).status).toBe(401);
+    const warned = s.harness.inspection.logEntries.filter((e) => e.level === "warn" && e.message.includes("without a usage token"));
+    expect(warned).toHaveLength(1);
+    expect(warned[0]?.message).toContain("pi update git:github.com/kalindudc/burn");
   });
 
   it("rejects a report without the token minted for its own thread", async () => {

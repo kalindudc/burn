@@ -45,6 +45,26 @@ export function WaitingNotice(): ReactNode {
   );
 }
 
+/** A pi thread that finished a turn, but whose session log is not in any folder its machine searched. */
+export function MissingLogNotice({ searched }: { searched: readonly string[] }): ReactNode {
+  return (
+    <div className="flex flex-col gap-1 text-xs" data-testid="missing-log">
+      <div className="font-semibold text-warning-text">Burn cannot find this thread's session log</div>
+      <p className="text-muted-foreground">
+        The thread has finished a turn, but its machine has no pi session log for it in the folders Burn reads, so Burn cannot show its cost.
+        If bb keeps pi's sessions elsewhere, updating the Burn pi extension lets it tell Burn where.
+      </p>
+      {searched.length > 0 ? (
+        <ul className="font-mono text-[11px] break-all text-muted-foreground">
+          {searched.map((dir) => (
+            <li key={dir}>{dir}</li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
 export function EstimatedNote(): ReactNode {
   return (
     <p className="text-[11px] text-muted-foreground" data-testid="estimated">
@@ -284,7 +304,7 @@ export function BurnCard({ answer, threadId, defaultBudget, discounted, now, onO
       </div>
       {report === null ? (
         <div className="px-3 py-2.5">
-          <WaitingNotice />
+          {answer?.missingLog ? <MissingLogNotice searched={answer.missingLog.searched} /> : <WaitingNotice />}
         </div>
       ) : (
         <>

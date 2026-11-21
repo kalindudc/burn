@@ -6,7 +6,7 @@ import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/
 import { afterEach, describe, expect, it } from "vitest";
 import { CHANGED_MAX } from "../../extensions/bb/host/contract.js";
 import hostEntry, { createHostEntry, realDir } from "../../extensions/bb/host/entry.js";
-import { createPiSessions, legacySessionDir, piSessionDirs, sessionFile } from "../../extensions/bb/host/pi-sessions.js";
+import { createPiSessions, hintedDir, legacySessionDir, piSessionDirs, sessionFile } from "../../extensions/bb/host/pi-sessions.js";
 import { assistant, toolResult, user } from "../helpers.js";
 
 const dirs: string[] = [];
@@ -66,6 +66,20 @@ describe("piSessionDirs and sessionFile", () => {
       "/home/me/.bb/pi-bridge-sessions",
     ]);
     expect(piSessionDirs({ home: "/home/me", env: { BB_PI_BRIDGE_SESSION_DIR: "  " } })).toHaveLength(2);
+  });
+});
+
+describe("hintedDir", () => {
+  it("is the folder of a session file that names one of the thread's sessions", () => {
+    expect(hintedDir("/custom/sessions/pi_one.jsonl", ["pi_one", "pi_two"])).toBe("/custom/sessions");
+    expect(hintedDir("/custom/a/../sessions/pi_two.jsonl", ["pi_one", "pi_two"])).toBe("/custom/sessions");
+  });
+
+  it("is null for another thread's session, a file that is not a session log, a relative path or none", () => {
+    expect(hintedDir("/custom/sessions/pi_other.jsonl", ["pi_one"])).toBeNull();
+    expect(hintedDir("/custom/sessions/pi_one.txt", ["pi_one"])).toBeNull();
+    expect(hintedDir("sessions/pi_one.jsonl", ["pi_one"])).toBeNull();
+    expect(hintedDir(undefined, ["pi_one"])).toBeNull();
   });
 });
 
@@ -172,6 +186,21 @@ describe("createPiSessions over several folders", () => {
     } finally {
       chmodSync(f.legacy, 0o700);
     }
+  });
+
+  it("reads every one of the thread's sessions in a folder named for this read, but no link there", async () => {
+    const f = folders();
+    const custom = join(f.bridge, "..", "custom");
+    const elsewhere = join(f.bridge, "..", "elsewhere");
+    mkdirSync(custom);
+    mkdirSync(elsewhere);
+    // A thread resumed in another worktree has a session before and after; both are in the custom folder.
+    f.write(custom, "pi_before", [user(), assistant(4)]);
+    f.write(custom, "pi_after", [user(), assistant(5)]);
+    f.write(elsewhere, "pi_linked", [user(), assistant(100)]);
+    symlinkSync(sessionFile(elsewhere, "pi_linked"), sessionFile(custom, "pi_linked"));
+    expect(await f.sessions.reportOf(["pi_before", "pi_after", "pi_linked"], ZONE)).toBeNull();
+    expect((await f.sessions.reportOf(["pi_before", "pi_after", "pi_linked"], ZONE, custom))?.report.cost.total).toBeCloseTo(9);
   });
 
   it("is null when no folder holds the session", async () => {
@@ -383,7 +412,7 @@ describe("host entry", () => {
     expect(got.reports).toHaveLength(1);
     expect(got.reports[0]).toMatchObject({ threadId: THREAD, at: expect.any(Number) });
     expect(got.reports[0]?.report?.cost.total).toBeCloseTo(2.5);
-    expect((await t.reports(["pi_none"])).reports).toEqual([{ threadId: THREAD, report: null, at: null }]);
+    expect((await t.reports(["pi_none"])).reports).toEqual([{ threadId: THREAD, report: null, at: null, searched: [t.dir] }]);
     expect(t.watches.map((w) => w.options)).toEqual([{ rootPath: realpathSync(t.dir), ignoredPaths: [], debounceMs: 150, maxWaitMs: 1000 }]);
     await t.h.experimental_dispose();
   });
@@ -525,6 +554,43 @@ describe("host entry", () => {
     expect(h.experimental_getSignals()).toEqual([]);
     ready!();
     await expect.poll(() => h.experimental_getSignals()).toEqual([{ signal: "changed", payload: { sessionIds: [], all: true } }]);
+    await h.experimental_dispose();
+  });
+
+  it("reads the folder a thread's pi named without watching it, and says where it looked when no folder holds the log", async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "burn-entry-")));
+    dirs.push(base);
+    const [usual, custom, linked] = [join(base, "usual"), join(base, "custom"), join(base, "linked")];
+    for (const dir of [usual, custom, linked]) mkdirSync(dir);
+    writeFileSync(sessionFile(custom, "pi_one"), [headerOf("pi_one"), user(), assistant(4)].map(line).join(""));
+    writeFileSync(sessionFile(custom, "pi_four"), [headerOf("pi_four"), user(), assistant(5)].map(line).join(""));
+    symlinkSync(sessionFile(custom, "pi_four"), sessionFile(linked, "pi_four"));
+    const roots: string[] = [];
+    const entry = createHostEntry({ piDirs: () => [usual] });
+    const h = experimental_createHostEntryHarness(entry, {
+      experimental_watch: (options) => {
+        roots.push(options.rootPath);
+        return { dispose: async () => undefined };
+      },
+    });
+    const got = await h.experimental_call("reports", {
+      harness: "pi",
+      timeZone: "UTC",
+      threads: [
+        { threadId: "thr_aaaaaaaa", sessionIds: ["pi_one"], sessionFile: sessionFile(custom, "pi_one") },
+        { threadId: "thr_bbbbbbbb", sessionIds: ["pi_two"], sessionFile: sessionFile(custom, "pi_one") },
+        { threadId: "thr_cccccccc", sessionIds: ["pi_three"], sessionFile: sessionFile(custom, "pi_three") },
+        { threadId: "thr_dddddddd", sessionIds: ["pi_four"], sessionFile: sessionFile(linked, "pi_four") },
+      ],
+    });
+    expect(got.reports[0]).toMatchObject({ unwatched: true });
+    expect(got.reports[0]?.report?.cost.total).toBeCloseTo(4);
+    // Another thread's file name is no hint at all. A file that is not there yet, or a link, is not read, but the
+    // thread's log is still outside what the host watches, so each report from its pi reads it again.
+    expect(got.reports[1]).toEqual({ threadId: "thr_bbbbbbbb", report: null, at: null, searched: [usual] });
+    expect(got.reports[2]).toEqual({ threadId: "thr_cccccccc", report: null, at: null, searched: [custom, usual], unwatched: true });
+    expect(got.reports[3]).toEqual({ threadId: "thr_dddddddd", report: null, at: null, searched: [linked, usual], unwatched: true });
+    expect(roots).toEqual([usual]);
     await h.experimental_dispose();
   });
 

@@ -48,6 +48,8 @@ const usageOutput = z.object({
   budget: effectiveBudgetSchema.nullable(),
   policy: policySchema,
   family: familySchema,
+  /** A pi thread that finished a turn but has no session log in the folders its machine searched. */
+  missingLog: z.object({ searched: z.array(z.string()) }).nullable().optional(),
 });
 
 const costRow = z.object({

@@ -154,14 +154,19 @@ export const usageReportSchema: z.ZodType<UsageReport, unknown> = z.union([
   ),
 ]);
 
+/** Longest session file path a report may name; longer is not a path on any machine bb runs on. */
+export const SESSION_FILE_MAX = 4096;
+
 export const usageEnvelopeSchema = z.object({
   threadId: z.string().regex(THREAD_ID),
   sentAt: count,
   report: usageReportSchema,
+  /** pi's own session log, from Burn pi extensions newer than 0.11.1. */
+  sessionFile: z.string().min(1).max(SESSION_FILE_MAX).optional(),
 });
 
 /** A thread's latest report as the plugin keeps it: `sentAt` from pi, `at` when bb received it. */
-export const storedSchema = z.object({ report: usageReportSchema, sentAt: z.number(), at: z.number() });
+export const storedSchema = z.object({ report: usageReportSchema, sentAt: z.number(), at: z.number(), sessionFile: z.string().max(SESSION_FILE_MAX).optional() });
 export type Stored = z.infer<typeof storedSchema>;
 
 export const policySchema = z.object({

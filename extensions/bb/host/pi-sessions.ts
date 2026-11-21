@@ -1,6 +1,6 @@
-import { open, readdir, stat } from "node:fs/promises";
+import { lstat, open, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { buildReport, type EntryLike, forkedAt, slimEntry, type UsageReport } from "../../../src/report.js";
 
 const NEWLINE = 0x0a;
@@ -60,6 +60,18 @@ export const sessionStem = (id: string): string => id.replace(/[^A-Za-z0-9._-]/g
 
 export const sessionFile = (dir: string, id: string): string => join(dir, `${sessionStem(id)}${EXTENSION}`);
 
+/**
+ * The folder of the session log a thread's pi reported, when the file is named for one of the
+ * thread's own sessions; else null. Only the thread's own session file names are read there, each
+ * only when it is a regular file, so a report cannot point Burn at another thread's log, at a link
+ * or at a file that is not a session log.
+ */
+export function hintedDir(file: string | undefined, sessionIds: readonly string[]): string | null {
+  if (file === undefined || !isAbsolute(file)) return null;
+  const name = basename(file);
+  return sessionIds.some((id) => `${sessionStem(id)}${EXTENSION}` === name) ? dirname(resolve(file)) : null;
+}
+
 /** What has been read of one log: `offset` bytes, of which `carry` is a line pi has not finished writing. */
 interface FileState {
   offset: number;
@@ -73,8 +85,11 @@ interface FileState {
 }
 
 export interface PiSessions {
-  /** The report of a thread's sessions on this machine; null when none has a file. */
-  reportOf(sessionIds: readonly string[], timeZone: string): Promise<{ report: UsageReport; at: number } | null>;
+  /**
+   * The report of a thread's sessions on this machine; null when none has a file. `hintedDir` is one
+   * more folder for the thread's sessions, where only regular files count (pi layout only).
+   */
+  reportOf(sessionIds: readonly string[], timeZone: string, hintedDir?: string): Promise<{ report: UsageReport; at: number } | null>;
   /** The session a changed path belongs to, or null when it is not a session log. */
   sessionIdOf(path: string): string | null;
 }
@@ -252,12 +267,18 @@ export function createPiSessions(
    * the old one. So the copy written last comes first, then the larger, then the folder listed first.
    * A copy that cannot be read gives way to the next one.
    */
-  async function copiesOf(dirs: readonly string[], id: string, denied: Map<string, unknown>): Promise<string[]> {
+  async function copiesOf(dirs: readonly string[], id: string, denied: Map<string, unknown>, hinted?: string): Promise<string[]> {
     const found: { path: string; mtimeMs: number; size: number; order: number }[] = [];
-    for (const [order, dir] of dirs.entries()) {
-      const path = sessionFile(dir, id);
+    const candidates = [...new Set([...(hinted === undefined ? [] : [sessionFile(hinted, id)]), ...dirs.map((dir) => sessionFile(dir, id))])];
+    for (const [order, path] of candidates.entries()) {
       try {
-        const info = await stat(path);
+        // A folder a report named counts only its regular files, never a link to some other log.
+        const isHinted = hinted !== undefined && order === 0;
+        const info = isHinted ? await lstat(path) : await stat(path);
+        if (isHinted && !info.isFile()) {
+          files.delete(path);
+          continue;
+        }
         found.push({ path, mtimeMs: info.mtimeMs, size: info.size, order });
       } catch (err) {
         files.delete(path);
@@ -314,10 +335,16 @@ export function createPiSessions(
     return { found: discovered, incomplete };
   }
 
-  async function pathsOf(ids: ReadonlySet<string>, denied: Map<string, unknown>): Promise<{ paths: { path: string; id: string }[]; incomplete: boolean }> {
+  async function pathsOf(
+    ids: ReadonlySet<string>,
+    denied: Map<string, unknown>,
+    hinted?: string,
+  ): Promise<{ paths: { path: string; id: string }[]; incomplete: boolean }> {
     if (opts.layout !== "omp") {
       const paths = [];
-      for (const id of ids) for (const path of await copiesOf(opts.dirs, id, denied)) paths.push({ path, id });
+      for (const id of ids) {
+        for (const path of await copiesOf(opts.dirs, id, denied, hinted)) paths.push({ path, id });
+      }
       return { paths, incomplete: false };
     }
     const now = Date.now();
@@ -340,7 +367,7 @@ export function createPiSessions(
   }
 
   return {
-    async reportOf(sessionIds, timeZone) {
+    async reportOf(sessionIds, timeZone, hinted) {
       const foundById = new Map<string, FileState>();
       const ids = new Set(sessionIds.filter((id) => opts.layout !== "omp" || OMP_ID.test(id)));
       const missing = new Set<string>();
@@ -376,7 +403,7 @@ export function createPiSessions(
           }
         }
       }
-      const initial = await pathsOf(ids, denied);
+      const initial = await pathsOf(ids, denied, hinted);
       unreadable ||= initial.incomplete;
       await collect(initial.paths);
       if (opts.layout === "omp" && missing.size > 0) {

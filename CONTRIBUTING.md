@@ -27,4 +27,4 @@ Unverified claims, fabricated test results, unrelated rewrites, and generated ch
 
 ## Local checks
 
-Run `npm ci`, `npm test`, and `npm run typecheck`. For changes to the bb plugin, also run `bb plugin build`. On Node 26, use `NODE_OPTIONS=--no-experimental-webstorage npm test` to avoid a Web Storage conflict with jsdom. Include the actual results in the PR.
+Run `npm ci`, `npm test`, and `npm run typecheck`. The Checks workflow runs the last two on every pull request, and on every push to `main` before a release is tagged. For changes to the bb plugin, also run `bb plugin build`, which CI does not. On Node 26, use `NODE_OPTIONS=--no-experimental-webstorage npm test` to avoid a Web Storage conflict with jsdom. Include the actual results in the PR.

@@ -263,7 +263,12 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   });
   const usageSecret = await ensureUsageSecret(bb);
   let priceOverrides: PriceOverrides = readPriceOverrides((await settings.get()).priceOverrides);
-  const source = createReportSource(bb, { onChange: changed, threads: directory, overrides: () => priceOverrides });
+  const source = createReportSource(bb, {
+    onChange: changed,
+    threads: directory,
+    overrides: () => priceOverrides,
+    sessionFileOf: async (threadId) => (await load(threadId))?.sessionFile ?? null,
+  });
   bb.onDispose(() => source.dispose());
   settings.onChange((next) => {
     const overrides = readPriceOverrides(next.priceOverrides);
@@ -708,7 +713,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
         family.lastTurnCost = spawnedTurnCost(threadId, report.turns.at(-1)?.at, report.lastTurnCost,
           reportsIn(resolved, descendants), await directory.all().catch(() => []));
       }
-      return { report, source: own?.source ?? null, reportedAt: own?.at ?? null, title, budget, policy, family };
+      return { report, source: own?.source ?? null, reportedAt: own?.at ?? null, title, budget, policy, family, missingLog: report === null ? source.missingLog(threadId) : null };
     },
   );
   const costsRead = coalesce(
@@ -796,7 +801,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     if (token === "") {
       if (!missingTokenWarned) {
         missingTokenWarned = true;
-        bb.log.warn("a pi session reported without a usage token; restart it to pick up BURN_BB_TOKEN. Its cost still comes from the session log.");
+        bb.log.warn(
+          "a pi session reported without a usage token, so Burn ignored its report. Its Burn pi extension is older than 0.9.0, or the session started before Burn was installed: update the extension with `pi update git:github.com/kalindudc/burn` and restart the session. Its cost still comes from the session log.",
+        );
       }
       return c.json({ ok: false, error: "invalid usage token" } satisfies UsageReply, 401);
     }
@@ -810,7 +817,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     }
     const envelope = usageEnvelopeSchema.safeParse(body);
     if (!envelope.success) return c.json({ ok: false, error: "invalid usage report" } satisfies UsageReply, 400);
-    const { threadId, sentAt, report } = envelope.data;
+    const { threadId, sentAt, report, sessionFile } = envelope.data;
     // The token names the thread it was minted for, so one thread's pi cannot overwrite another thread's figures or read its budget.
     if (!sameToken(token, usageToken(usageSecret, threadId))) {
       return c.json({ ok: false, error: "invalid usage token" } satisfies UsageReply, 401);
@@ -818,7 +825,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     const policy = await policyOf(threadId);
     const held = await load(threadId);
     if (held && sentAt < held.sentAt) return c.json({ ok: true, policy } satisfies UsageReply);
-    const stored: Stored = { report, sentAt, at: Date.now() };
+    const stored: Stored = { report, sentAt, at: Date.now(), ...(sessionFile ? { sessionFile } : {}) };
+    // A log the host may not have found yet, or one in a folder it does not watch: read the thread from its machine again.
+    if (sessionFile && (sessionFile !== held?.sessionFile || source.unwatched(threadId))) source.invalidate(threadId);
     remember(reports, threadId, stored);
     try {
       await bb.storage.kv.set(reportKey(threadId), stored);

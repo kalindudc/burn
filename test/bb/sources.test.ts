@@ -31,7 +31,7 @@ type Thread = { host: string | null; provider?: string; status?: "active" | "idl
 /** A source over fake threads; each host answers with `costs[threadId]`, or throws when listed in `offline`. */
 function setup(
   threads: Record<string, Thread>,
-  opts: { offline?: string[]; disconnected?: string[]; listFails?: boolean; directory?: boolean; coverageNote?: string; retryMs?: number; retryMax?: number; hostWaitStepsMs?: number[] } = {},
+  opts: { offline?: string[]; disconnected?: string[]; listFails?: boolean; directory?: boolean; coverageNote?: string; retryMs?: number; retryMax?: number; hostWaitStepsMs?: number[]; denied?: Set<string> } = {},
 ) {
   const costs: Record<string, number> = {};
   const rows: EventRow[] = [];
@@ -119,7 +119,9 @@ function setup(
       return {
         dir: "/home/me/.bb/pi-bridge-sessions",
         reports: input.threads.map(({ threadId }) =>
-          threadId in costs
+          opts.denied?.has(threadId)
+            ? { threadId, report: null, at: null, error: `EACCES: permission denied, stat '/home/me/.bb/pi-bridge-sessions/pi_${threadId}.jsonl'` }
+            : threadId in costs
             ? {
                 threadId,
                 report: { ...costOf(costs[threadId]!), ...(opts.coverageNote ? { coverageNote: opts.coverageNote, coverage: "partial" } : {}) },
@@ -1138,6 +1140,25 @@ describe("createReportSource and a host that fails", () => {
   });
 });
 
+it("keeps the last figures of a thread whose log the host may not read, and logs that host once", async () => {
+  const denied = new Set<string>();
+  const s = setup({ [id(1)]: { host: A }, [id(2)]: { host: A }, [id(3)]: { host: A } }, { denied });
+  s.costs[id(1)] = 4;
+  s.costs[id(3)] = 2;
+  expect(await s.cost(id(1), id(2), id(3))).toEqual([4, null, 2]);
+  denied.add(id(1));
+  denied.add(id(2));
+  s.costs[id(3)] = 5;
+  s.tick(60_000);
+  expect(await s.cost(id(1), id(2), id(3))).toEqual([4, null, 5]);
+  s.tick(60_000);
+  expect(await s.cost(id(1), id(2), id(3))).toEqual([4, null, 5]);
+  const denials = s.warnings().filter((w) => w.includes("EACCES"));
+  expect(denials).toHaveLength(1);
+  expect(denials[0]).toContain(A);
+  await s.harness.lifecycle.dispose();
+});
+
 describe("createReportSource with the real host entry", () => {
   it("reads a pi session log on the host and updates as soon as the host signals a change", async () => {
     const dir = mkdtempSync(join(tmpdir(), "burn-sources-"));
@@ -1147,7 +1168,7 @@ describe("createReportSource with the real host entry", () => {
     const header = { type: "session", version: 3, id: "s", timestamp: "2026-10-18T12:00:00.000Z", cwd: "/tmp" };
     writeFileSync(file, [header, user(), assistant(1.5)].map((e) => `${JSON.stringify(e)}\n`).join(""));
     let listener: ExperimentalHostWatchListener | null = null;
-    const host = experimental_createHostEntryHarness(createHostEntry({ dir }), {
+    const host = experimental_createHostEntryHarness(createHostEntry({ piDirs: () => [dir] }), {
       experimental_watch: (_options, l) => {
         listener = l;
         return { dispose: async () => undefined };
@@ -1203,6 +1224,35 @@ describe("Claude transcript source selection", () => {
     expect(got?.report.calls).toBe(1);
     await s.harness.lifecycle.dispose();
   });
+});
+
+it("keeps a saved pi report with more spend over a partial one, also once the host is offline", async () => {
+  const opts: { coverageNote?: string; offline?: string[] } = {};
+  const s = setup({ [id(1)]: { host: A } }, opts);
+  s.costs[id(1)] = 9;
+  expect(await s.cost(id(1))).toEqual([9]);
+  opts.coverageNote = "Partial pi session history: Burn may not read some of this thread's session logs.";
+  s.costs[id(1)] = 3;
+  s.tick(60_000);
+  const got = (await s.source.reportsOf([id(1)])).get(id(1));
+  expect(got?.report).toMatchObject({ cost: { total: 9 }, coverage: "partial", coverageNote: expect.stringContaining("last saved session report") });
+  s.offline.add(A);
+  s.tick(60_000);
+  expect(await s.cost(id(1))).toEqual([9]);
+  s.offline.delete(A);
+  s.costs[id(1)] = 12;
+  s.tick(60_000);
+  expect((await s.source.reportsOf([id(1)])).get(id(1))?.report).toMatchObject({ cost: { total: 12 }, coverage: "partial" });
+  // A partial report, even one with more spend, never replaces the complete one saved with its days.
+  const saved = (await s.bb.storage.kv.get(`log:${id(1)}`)) as { report: { cost: { total: number }; coverage?: string } };
+  expect(saved.report.cost.total).toBe(9);
+  expect(saved.report.coverage).toBeUndefined();
+  delete opts.coverageNote;
+  s.costs[id(1)] = 13;
+  s.tick(60_000);
+  expect(await s.cost(id(1))).toEqual([13]);
+  expect(((await s.bb.storage.kv.get(`log:${id(1)}`)) as { report: { cost: { total: number } } }).report.cost.total).toBe(13);
+  await s.harness.lifecycle.dispose();
 });
 
 it("preserves a saved Claude report when a later read has missing session identities", async () => {

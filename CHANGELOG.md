@@ -4,6 +4,12 @@ Notable changes to Burn, newest first.
 
 Burn follows [semantic versioning](https://semver.org). Releases from 0.4.0 on are tagged `vX.Y.Z` in this repository; earlier versions were not tagged. Each release's commit message has the full detail, including how the release was checked.
 
+## 0.11.1 - 2026-11-21
+
+pi threads in bb show their cost again. Newer bb moved pi's session logs to a new folder, and Burn now reads both the new folder and the old one.
+
+- **pi threads show their cost again on newer bb.** Newer bb keeps pi session logs in its pi provider's own data folder, `~/.bb/plugins/provider-pi/bridge-data/sessions`, instead of `~/.bb/pi-bridge-sessions`. Burn read only the old folder, so pi threads started after the move showed no cost, and threads from before it showed only what they had spent up to the move. Burn now reads both folders and, when both hold a thread's log, uses the copy written most recently, so it works with older and newer bb alike. Burn cannot follow `BB_PI_BRIDGE_SESSION_DIR` when bb gives it only to the pi bridge; see [session logs](docs/troubleshooting.md#session-logs).
+
 ## 0.11.0 - 2026-11-20
 
 Burn now reads detailed usage from native OMP sessions in bb, estimates the cost of GPT-6.2 Sol and Astra in Codex, and shows the full child-thread count for large families.

@@ -2,7 +2,7 @@
 
 ## Troubleshooting
 
-- **The chip shows a dashed "—" in bb.** The thread has made no model call yet, or its harness sends bb no usage. For a pi thread it can also mean that Burn found no session log on the thread's machine and no report from pi. Check that bb keeps its pi sessions in the default folder; see [session logs](#session-logs) below. For an OpenCode thread it can mean that Burn found no opencode database on the thread's machine at `~/.local/share/opencode/opencode.db`, or under `$XDG_DATA_HOME/opencode` when that is set.
+- **The chip shows a dashed "—" in bb.** The thread has made no model call yet, or its harness sends bb no usage. For a pi thread it can also mean that Burn found no session log on the thread's machine and no report from pi. Check that bb keeps its pi sessions in one of the folders Burn reads; see [session logs](#session-logs) below. For an OpenCode thread it can mean that Burn found no opencode database on the thread's machine at `~/.local/share/opencode/opencode.db`, or under `$XDG_DATA_HOME/opencode` when that is set.
 - **The chip's tooltip says Burn has seen no new usage for a while, such as "3h".** bb says a pi or OpenCode thread is working, but its session log or opencode's database has not changed for at least five minutes. A long tool call does this, and so does an agent that has stopped. The chip keeps its working animation, because bb, not the log, says whether the thread is working. Threads of other harnesses never show this note, because a Claude Code turn can run for minutes before bb records its usage.
 - **There is no chip in bb.** Check that the **Cost chip** setting in Burn's plugin settings is on. `bb plugin list` should show `burn` as running.
 - **The chip is in the thread header, not the footer.** Burn did not find bb's footer markup; see [bb's page markup](#bbs-page-markup) below. The chip works the same there. On a phone, the header shows only the flame until you expand the prompt box, and the chip then moves to the footer.
@@ -20,7 +20,19 @@ Burn checks the daily budget at most every 30 seconds, so its notification can a
 
 ### Session logs
 
-Burn reads pi's session logs from `~/.bb/pi-bridge-sessions` on each machine. bb's pi bridge can be pointed elsewhere with `BB_PI_BRIDGE_SESSION_DIR`, but Burn does not follow it.
+Burn reads pi's session logs from two folders on each machine, so it works with any version of bb:
+
+- `plugins/provider-pi/bridge-data/sessions` in bb's data folder, usually `~/.bb`. Newer bb keeps its pi sessions there. Burn finds the folder from its own data folder on that machine.
+- `~/.bb/pi-bridge-sessions`, where older bb kept them.
+
+Newer bb copies a thread's log from the old folder into the new one the next time the thread runs, and then writes only to the new copy. A thread that has not run since keeps only its old log. When both folders hold a session, Burn reads the copy with the newest modification time, which is normally the one bb still writes to, and skips the other:
+
+- After a move back to an older bb, the old folder's copy is newer. It lacks what the thread spent while the newer bb ran it.
+- A log restored from a backup without its original modification time looks newer than it is, so Burn can show the restored copy's lower figures until bb writes to the other copy again.
+
+If Burn may not read a copy, it reads the next one. If no copy can be read, that thread keeps the last figures Burn read for it, and Burn logs the machine once. A thread with several pi sessions, one of which Burn may not read, is marked partial. Burn shows the partial figures only while they are higher than the last complete ones, and never saves them, so the complete figures stay to fall back on.
+
+bb's pi bridge can be pointed elsewhere with `BB_PI_BRIDGE_SESSION_DIR`, and then it writes only to that folder. bb 0.50.1 removes `BB_*` variables that plugin code would inherit from bb's own environment, so Burn sees the variable only when it is set in bb's machine environment, and the pi bridge may not see it from there. When Burn sees it, Burn reads that folder first and still reads the two folders above. When only the pi bridge sees it, Burn shows no cost for the threads whose logs are there.
 
 A log with more than 50,000 entries is read from its newest entries, as OpenCode's own reader does with its 20,000 messages, so a single extremely long session drops its oldest spend from the figures. Across all logs Burn keeps at most 200,000 entries in memory and reads an evicted log again from the beginning when something asks for it. If the logs that are being polled at once hold more than that, the cost is repeated reads rather than growing memory. A line with no newline larger than 4 MB is dropped rather than held.
 

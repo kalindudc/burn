@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExperimentalHostWatchListener, ExperimentalHostWatchOptions } from "@get-bb/plugin-sdk";
@@ -6,7 +6,7 @@ import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/
 import { afterEach, describe, expect, it } from "vitest";
 import { CHANGED_MAX } from "../../extensions/bb/host/contract.js";
 import hostEntry, { createHostEntry, realDir } from "../../extensions/bb/host/entry.js";
-import { createPiSessions, sessionDir, sessionFile } from "../../extensions/bb/host/pi-sessions.js";
+import { createPiSessions, legacySessionDir, piSessionDirs, sessionFile } from "../../extensions/bb/host/pi-sessions.js";
 import { assistant, toolResult, user } from "../helpers.js";
 
 const dirs: string[] = [];
@@ -29,7 +29,7 @@ const stamped = (iso: string) => <T extends { timestamp: string }>(entry: T): T 
 function setup(limits?: { entriesFileMax?: number; entriesTotalMax?: number; carryMaxBytes?: number }) {
   const dir = mkdtempSync(join(tmpdir(), "burn-host-"));
   dirs.push(dir);
-  const sessions = createPiSessions({ dir, ...(limits ? { limits } : {}) });
+  const sessions = createPiSessions({ dirs: [dir], ...(limits ? { limits } : {}) });
   const path = (id: string) => sessionFile(dir, id);
   const write = (id: string, entries: unknown[], header: unknown = headerOf(id)): string => {
     writeFileSync(path(id), [header, ...entries].map(line).join(""));
@@ -39,11 +39,144 @@ function setup(limits?: { entriesFileMax?: number; entriesTotalMax?: number; car
   return { dir, sessions, path, write, cost };
 }
 
-describe("sessionDir and sessionFile", () => {
-  it("name the folder and files the way bb's pi bridge does", () => {
-    expect(sessionDir("/home/me")).toBe("/home/me/.bb/pi-bridge-sessions");
+describe("piSessionDirs and sessionFile", () => {
+  it("name the files the way bb's pi bridge does", () => {
+    expect(legacySessionDir("/home/me")).toBe("/home/me/.bb/pi-bridge-sessions");
     expect(sessionFile("/d", "pi_ef25-17")).toBe("/d/pi_ef25-17.jsonl");
     expect(sessionFile("/d", "a/b c")).toBe("/d/a_b_c.jsonl");
+  });
+
+  it("finds provider-pi's bridge folder beside this plugin's host data, then the folder older bb used", () => {
+    expect(piSessionDirs({ hostDataDir: "/data/bb/plugins/burn/host-data", home: "/home/me", env: {} })).toEqual([
+      "/data/bb/plugins/provider-pi/bridge-data/sessions",
+      "/home/me/.bb/pi-bridge-sessions",
+    ]);
+  });
+
+  it("falls back to ~/.bb when bb gives no host data folder it recognises", () => {
+    const expected = ["/home/me/.bb/plugins/provider-pi/bridge-data/sessions", "/home/me/.bb/pi-bridge-sessions"];
+    expect(piSessionDirs({ home: "/home/me", env: {} })).toEqual(expected);
+    expect(piSessionDirs({ hostDataDir: "/test/plugin-data", home: "/home/me", env: {} })).toEqual(expected);
+  });
+
+  it("reads BB_PI_BRIDGE_SESSION_DIR first when the host sees it, and keeps the folders the bridge may still use", () => {
+    expect(piSessionDirs({ home: "/home/me", env: { BB_PI_BRIDGE_SESSION_DIR: " /custom/sessions " } })).toEqual([
+      "/custom/sessions",
+      "/home/me/.bb/plugins/provider-pi/bridge-data/sessions",
+      "/home/me/.bb/pi-bridge-sessions",
+    ]);
+    expect(piSessionDirs({ home: "/home/me", env: { BB_PI_BRIDGE_SESSION_DIR: "  " } })).toHaveLength(2);
+  });
+});
+
+describe("createPiSessions over several folders", () => {
+  function folders() {
+    const base = mkdtempSync(join(tmpdir(), "burn-dirs-"));
+    dirs.push(base);
+    const bridge = join(base, "bridge");
+    const legacy = join(base, "legacy");
+    mkdirSync(bridge);
+    mkdirSync(legacy);
+    const sessions = createPiSessions({ dirs: [bridge, legacy] });
+    const write = (dir: string, id: string, entries: unknown[], mtime?: number): string => {
+      const path = sessionFile(dir, id);
+      writeFileSync(path, [headerOf(id), ...entries].map(line).join(""));
+      if (mtime !== undefined) utimesSync(path, mtime, mtime);
+      return path;
+    };
+    const cost = async (...ids: string[]) => (await sessions.reportOf(ids, ZONE))?.report.cost.total;
+    return { bridge, legacy, sessions, write, cost };
+  }
+
+  it("reads a session that only the older folder holds", async () => {
+    const f = folders();
+    f.write(f.legacy, "pi_old", [user(), assistant(1.5)]);
+    f.write(f.bridge, "pi_new", [user(), assistant(2)]);
+    expect(await f.cost("pi_old")).toBeCloseTo(1.5);
+    expect(await f.cost("pi_old", "pi_new")).toBeCloseTo(3.5);
+  });
+
+  it("counts a session copied into the bridge folder once, from the copy bb kept writing", async () => {
+    const f = folders();
+    f.write(f.legacy, "pi_one", [user(), assistant(1)], 1_700_000_000);
+    f.write(f.bridge, "pi_one", [user(), assistant(1)], 1_700_000_000);
+    expect(await f.cost("pi_one")).toBeCloseTo(1);
+    appendFileSync(sessionFile(f.bridge, "pi_one"), line(user()) + line(assistant(2)));
+    expect(await f.cost("pi_one")).toBeCloseTo(3);
+  });
+
+  it("follows the folder written last, even while its copy is the smaller one", async () => {
+    const f = folders();
+    f.write(f.bridge, "pi_one", [user(), assistant(1), user(), assistant(1), user(), assistant(1)], 1_700_000_000);
+    f.write(f.legacy, "pi_one", [user(), assistant(5)], 1_700_000_100);
+    expect(await f.cost("pi_one")).toBeCloseTo(5);
+  });
+
+  it("takes the larger copy when both were written at the same moment", async () => {
+    const f = folders();
+    f.write(f.bridge, "pi_one", [user(), assistant(1)], 1_700_000_000);
+    f.write(f.legacy, "pi_one", [user(), assistant(1), user(), assistant(4)], 1_700_000_000);
+    expect(await f.cost("pi_one")).toBeCloseTo(5);
+  });
+
+  it("reads a readable folder's copy when another folder cannot be read", async () => {
+    const f = folders();
+    f.write(f.bridge, "pi_one", [user(), assistant(2)]);
+    const flipped = createPiSessions({ dirs: [f.legacy, f.bridge] });
+    chmodSync(f.legacy, 0);
+    try {
+      expect(await f.cost("pi_one")).toBeCloseTo(2);
+      expect((await flipped.reportOf(["pi_one"], ZONE))?.report.cost.total).toBeCloseTo(2);
+    } finally {
+      chmodSync(f.legacy, 0o700);
+    }
+  });
+
+  it("reads the next copy when the newest one cannot be opened", async () => {
+    const f = folders();
+    f.write(f.bridge, "pi_one", [user(), assistant(2)], 1_700_000_000);
+    const newest = f.write(f.legacy, "pi_one", [user(), assistant(9)], 1_700_000_100);
+    chmodSync(newest, 0);
+    try {
+      expect(await f.cost("pi_one")).toBeCloseTo(2);
+    } finally {
+      chmodSync(newest, 0o600);
+    }
+  });
+
+  it("marks a thread's report partial when one of its sessions cannot be read in any folder", async () => {
+    const f = folders();
+    f.write(f.bridge, "pi_one", [user(), assistant(3)]);
+    const shut = f.write(f.legacy, "pi_two", [user(), assistant(6)]);
+    expect((await f.sessions.reportOf(["pi_one", "pi_two"], ZONE))?.report).toMatchObject({ cost: { total: 9 } });
+    expect((await f.sessions.reportOf(["pi_one", "pi_two"], ZONE))?.report.coverage).toBeUndefined();
+    chmodSync(shut, 0);
+    try {
+      const cold = createPiSessions({ dirs: [f.bridge, f.legacy] });
+      expect((await cold.reportOf(["pi_one", "pi_two"], ZONE))?.report).toMatchObject({
+        cost: { total: 3 },
+        coverage: "partial",
+        coverageNote: expect.stringContaining("may not read"),
+      });
+    } finally {
+      chmodSync(shut, 0o600);
+    }
+  });
+
+  it("fails the read when the only folders that could hold the session cannot be read", async () => {
+    const f = folders();
+    f.write(f.legacy, "pi_one", [user(), assistant(2)]);
+    chmodSync(f.legacy, 0);
+    try {
+      await expect(f.sessions.reportOf(["pi_one"], ZONE)).rejects.toThrow(/EACCES|EPERM/);
+    } finally {
+      chmodSync(f.legacy, 0o700);
+    }
+  });
+
+  it("is null when no folder holds the session", async () => {
+    const f = folders();
+    expect(await f.sessions.reportOf(["pi_none"], ZONE)).toBeNull();
   });
 });
 
@@ -182,7 +315,7 @@ describe("createPiSessions", () => {
   });
 
   it("names the session of a changed path, for .jsonl files only", () => {
-    expect(createPiSessions({ dir: "/d" }).sessionIdOf(".jsonl")).toBeNull();
+    expect(createPiSessions({ dirs: ["/d"] }).sessionIdOf(".jsonl")).toBeNull();
     const s = setup();
     expect(s.sessions.sessionIdOf(join(s.dir, "pi_one.jsonl"))).toBe("pi_one");
     expect(s.sessions.sessionIdOf("pi_two.jsonl")).toBe("pi_two");
@@ -221,7 +354,7 @@ describe("host entry", () => {
     const s = setup();
     const watches: { options: ExperimentalHostWatchOptions; listener: ExperimentalHostWatchListener; disposed: boolean }[] = [];
     let failures = opts.failWatch ?? 0;
-    const entry = createHostEntry({ dir: s.dir, ...(opts.watchWaitMs === undefined ? {} : { watchWaitMs: opts.watchWaitMs }) });
+    const entry = createHostEntry({ piDirs: () => [s.dir], ...(opts.watchWaitMs === undefined ? {} : { watchWaitMs: opts.watchWaitMs }) });
     const h = experimental_createHostEntryHarness(entry, {
       experimental_watch: (options, listener) => {
         if (failures > 0) {
@@ -312,6 +445,132 @@ describe("host entry", () => {
     // bb keeps retrying a watch that is not ready yet, so another would only pile up beside it.
     expect(t.watches).toHaveLength(1);
     await t.h.experimental_dispose();
+  });
+
+  it("reads the bridge folder beside the host data bb gives it, the older folder too, and watches both", async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "burn-entry-")));
+    dirs.push(base);
+    const hostDataDir = join(base, "bb", "plugins", "burn", "host-data");
+    const bridge = join(base, "bb", "plugins", "provider-pi", "bridge-data", "sessions");
+    const legacy = join(base, "home", ".bb", "pi-bridge-sessions");
+    for (const dir of [hostDataDir, bridge, legacy]) mkdirSync(dir, { recursive: true });
+    writeFileSync(sessionFile(bridge, "pi_new"), [headerOf("pi_new"), user(), assistant(2)].map(line).join(""));
+    writeFileSync(sessionFile(legacy, "pi_old"), [headerOf("pi_old"), user(), assistant(0.5)].map(line).join(""));
+    const listeners = new Map<string, ExperimentalHostWatchListener>();
+    const entry = createHostEntry({ piDirs: (dataDir) => piSessionDirs({ hostDataDir: dataDir, home: join(base, "home"), env: {} }) });
+    const h = experimental_createHostEntryHarness(entry, {
+      experimental_paths: { dataDir: hostDataDir, tempDir: join(base, "tmp") },
+      experimental_watch: (options, listener) => {
+        listeners.set(options.rootPath, listener);
+        return { dispose: async () => undefined };
+      },
+    });
+    const got = await h.experimental_call("reports", {
+      harness: "pi",
+      timeZone: "UTC",
+      threads: [
+        { threadId: "thr_aaaaaaaa", sessionIds: ["pi_new"] },
+        { threadId: "thr_bbbbbbbb", sessionIds: ["pi_old"] },
+      ],
+    });
+    expect(got.reports.map((r) => r.report?.cost.total)).toEqual([2, 0.5]);
+    expect([...listeners.keys()].sort()).toEqual([bridge, legacy].sort());
+    await listeners.get(legacy)!({ kind: "changed", changes: [{ path: sessionFile(legacy, "pi_old"), type: "update" }] });
+    await listeners.get(bridge)!({ kind: "changed", changes: [{ path: sessionFile(bridge, "pi_new"), type: "update" }] });
+    expect(h.experimental_getSignals().map((s) => s.payload.sessionIds)).toEqual([["pi_old"], ["pi_new"]]);
+    await h.experimental_dispose();
+  });
+
+  it("costs only its own thread when a folder cannot be read and no other folder holds the thread's log", async () => {
+    const base = mkdtempSync(join(tmpdir(), "burn-entry-"));
+    dirs.push(base);
+    const [open_, shut] = [join(base, "open"), join(base, "shut")];
+    for (const dir of [open_, shut]) mkdirSync(dir);
+    writeFileSync(sessionFile(open_, "pi_one"), [headerOf("pi_one"), user(), assistant(3)].map(line).join(""));
+    const entry = createHostEntry({ piDirs: () => [open_, shut] });
+    const h = experimental_createHostEntryHarness(entry, { experimental_watch: () => ({ dispose: async () => undefined }) });
+    chmodSync(shut, 0);
+    try {
+      const got = await h.experimental_call("reports", {
+        harness: "pi",
+        timeZone: "UTC",
+        threads: [
+          { threadId: "thr_aaaaaaaa", sessionIds: ["pi_one"] },
+          { threadId: "thr_bbbbbbbb", sessionIds: ["pi_two"] },
+        ],
+      });
+      expect(got.reports[0]?.report?.cost.total).toBeCloseTo(3);
+      expect(got.reports[1]).toMatchObject({ threadId: "thr_bbbbbbbb", report: null, at: null, error: expect.stringMatching(/EACCES|EPERM/) });
+    } finally {
+      chmodSync(shut, 0o700);
+    }
+    await h.experimental_dispose();
+  });
+
+  it("rereads everything once a watch on a folder that did not exist yet is ready", async () => {
+    const base = mkdtempSync(join(tmpdir(), "burn-entry-"));
+    dirs.push(base);
+    const here = join(base, "here");
+    mkdirSync(here);
+    let ready: (() => void) | null = null;
+    const entry = createHostEntry({ piDirs: () => [join(base, "later"), here] });
+    const h = experimental_createHostEntryHarness(entry, {
+      experimental_watch: (options) => {
+        const subscription = { dispose: async () => undefined };
+        if (!options.rootPath.endsWith("/later")) return subscription;
+        return new Promise((resolve) => (ready = () => resolve(subscription)));
+      },
+    });
+    await h.experimental_call("reports", { harness: "pi", timeZone: "UTC", threads: [{ threadId: THREAD, sessionIds: ["pi_one"] }] });
+    expect(h.experimental_getSignals()).toEqual([]);
+    ready!();
+    await expect.poll(() => h.experimental_getSignals()).toEqual([{ signal: "changed", payload: { sessionIds: [], all: true } }]);
+    await h.experimental_dispose();
+  });
+
+  it("waits only for the watches on folders that exist", async () => {
+    const base = mkdtempSync(join(tmpdir(), "burn-entry-"));
+    dirs.push(base);
+    const here = join(base, "here");
+    mkdirSync(here);
+    const entry = createHostEntry({ piDirs: () => [join(base, "missing"), here], watchWaitMs: 5000 });
+    const roots: string[] = [];
+    const h = experimental_createHostEntryHarness(entry, {
+      experimental_watch: (options) => {
+        roots.push(options.rootPath);
+        // bb answers a watch on a missing folder only once the folder appears.
+        if (options.rootPath.endsWith("/missing")) return new Promise(() => undefined);
+        return { dispose: async () => undefined };
+      },
+    });
+    const began = Date.now();
+    await h.experimental_call("reports", { harness: "pi", timeZone: "UTC", threads: [{ threadId: THREAD, sessionIds: ["pi_one"] }] });
+    expect(Date.now() - began).toBeLessThan(1000);
+    expect(roots).toHaveLength(2);
+    await h.experimental_dispose();
+  });
+
+  it("replaces only the watch that reported an error", async () => {
+    const base = mkdtempSync(join(tmpdir(), "burn-entry-"));
+    dirs.push(base);
+    const watches: { rootPath: string; listener: ExperimentalHostWatchListener; disposed: boolean }[] = [];
+    for (const name of ["a", "b"]) mkdirSync(join(base, name));
+    const entry = createHostEntry({ piDirs: () => [join(base, "a"), join(base, "b")] });
+    const h = experimental_createHostEntryHarness(entry, {
+      experimental_watch: (options, listener) => {
+        const watch = { rootPath: options.rootPath, listener, disposed: false };
+        watches.push(watch);
+        return { dispose: async () => void (watch.disposed = true) };
+      },
+    });
+    const reports = () => h.experimental_call("reports", { harness: "pi", timeZone: "UTC", threads: [{ threadId: THREAD, sessionIds: ["pi_one"] }] });
+    const on = (name: string) => watches.filter((w) => w.rootPath.endsWith(`/${name}`));
+    await reports();
+    await on("b")[0]!.listener({ kind: "watch-error", message: "watcher died" });
+    expect([on("a")[0]!.disposed, on("b")[0]!.disposed]).toEqual([false, true]);
+    await reports();
+    expect([on("a").length, on("b").length]).toEqual([1, 2]);
+    await h.experimental_dispose();
   });
 
   it("exports the entry for this machine's pi session folder", () => {

@@ -41,8 +41,8 @@ export const hostContract = defineRpcContract({
     output: z.object({
       /** The folder the host reads, for the server's log lines. */
       dir: z.string(),
-      /** `at` is when the thread's newest log last changed; both are null when the host has no log for it. */
-      reports: z.array(z.object({ threadId, report: usageReportSchema.nullable(), at: z.number().nullable() })),
+      /** `at` is when the thread's newest log last changed; both are null when the host has no log for it, and `error` says why when it could not read one. */
+      reports: z.array(z.object({ threadId, report: usageReportSchema.nullable(), at: z.number().nullable(), error: z.string().max(500).optional() })),
     }),
   },
 });

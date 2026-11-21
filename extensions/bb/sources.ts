@@ -177,6 +177,8 @@ export function createReportSource(
   // A host that failed, when it last did and how long it is left alone. Present from its first failure until
   // a read succeeds or bb says it connected, which is also how a failure is logged once, not on every attempt.
   const failures = new Map<string, { at: number; delay: number }>();
+  /** Hosts already logged for a pi session log this plugin may not read, so a host logs it once per load. */
+  const deniedHosts = new Map<string, true>();
   // The host read under way per thread, which a second caller joins instead of asking the host again, and
   // when the caller that started it stopped waiting: a joiner waits no longer, since that caller's late read signals.
   const reading = new Map<string, { run: Promise<void>; until: number }>();
@@ -556,24 +558,31 @@ export function createReportSource(
         return;
       }
       failures.delete(hostId);
-      for (const { threadId, report, at } of answer.reports) {
+      for (const { threadId, report, at, error } of answer.reports) {
+        if (error !== undefined && !deniedHosts.has(hostId)) {
+          remember(deniedHosts, hostId, true);
+          bb.log.warn(`reading the pi session log of ${threadId} on ${hostId} failed, so Burn shows the last figures it read for threads it cannot read there: ${error}`);
+        }
         let got: LogReport | null = report !== null && at !== null ? { report, at, source: "log" } : null;
-        if (gen === priceGeneration && (harness === "claude" || harness === "omp") && got?.report.coverage === "partial") {
+        if (gen === priceGeneration && got?.report.coverage === "partial") {
           const kept = await lastKept(threadId);
-          if (kept && (harness === "omp" ? kept.report.cost.total > got.report.cost.total : kept.report.coverage !== "partial")) {
+          // A session log is only ever appended to, so for pi and OMP a saved report with more spend is the fuller one.
+          if (kept && (harness === "claude" ? kept.report.coverage !== "partial" : kept.report.cost.total > got.report.cost.total)) {
+            const what = harness === "omp" ? "OMP" : harness === "pi" ? "pi" : "Claude";
             got = {
               ...kept,
               report: {
                 ...kept.report,
                 coverage: "partial",
-                coverageNote: `Partial latest ${harness === "omp" ? "OMP" : "Claude"} history: showing the last saved transcript report.`,
+                coverageNote: `Partial latest ${what} history: showing the last saved ${harness === "claude" ? "transcript" : "session"} report.`,
               },
             };
           }
         }
         answers.set(threadId, got);
         if (gen === priceGeneration && (versions.get(threadId) ?? 0) === seen.get(threadId)) remember(reports, threadId, { got, checkedAt }, REPORTS_MAX);
-        if (got) await save(threadId, got, gen);
+        // A partial pi report is shown but never saved, so the last complete one, with its days, stays to fall back on.
+        if (got && !(harness === "pi" && got.report.coverage === "partial")) await save(threadId, got, gen);
       }
     }
   }

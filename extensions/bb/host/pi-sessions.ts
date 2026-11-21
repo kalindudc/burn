@@ -1,6 +1,6 @@
 import { open, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { buildReport, type EntryLike, forkedAt, slimEntry, type UsageReport } from "../../../src/report.js";
 
 const NEWLINE = 0x0a;
@@ -16,14 +16,37 @@ const ENTRIES_TOTAL_MAX = 200_000;
 const CARRY_MAX_BYTES = 4 * 1024 * 1024;
 const EXTENSION = ".jsonl";
 
-/**
- * Where bb's pi bridge keeps each pi session on this machine (provider-pi's
- * resolvePiBridgeSessionDir). The bridge also honours BB_PI_BRIDGE_SESSION_DIR,
- * but host workers never see the daemon's BB_* variables.
- */
-export function sessionDir(home = homedir()): string {
+/** Where older bb kept every pi session. Newer bb copies a log from here into its bridge folder when the thread next runs. */
+export function legacySessionDir(home = homedir()): string {
   return join(home, ".bb", "pi-bridge-sessions");
 }
+
+/** bb's data folder: bb gives a host worker `<bb data>/plugins/<plugin id>/host-data`. */
+function bbDataDir(hostDataDir: string | undefined, home: string): string {
+  if (hostDataDir !== undefined && basename(hostDataDir) === "host-data" && basename(dirname(dirname(hostDataDir))) === "plugins") {
+    return dirname(dirname(dirname(hostDataDir)));
+  }
+  return join(home, ".bb");
+}
+
+/**
+ * Every folder that can hold a pi session log on this machine: BB_PI_BRIDGE_SESSION_DIR when this
+ * worker sees it, provider-pi's `<bb data>/plugins/provider-pi/bridge-data/sessions`, then the folder
+ * older bb used. The defaults stay in the list because bb can give the variable to plugins without
+ * giving it to the bridge, which then still writes to its default folder.
+ */
+export function piSessionDirs(opts: { hostDataDir?: string; env?: Readonly<Record<string, string | undefined>>; home?: string } = {}): string[] {
+  const home = opts.home ?? homedir();
+  const override = (opts.env ?? process.env).BB_PI_BRIDGE_SESSION_DIR?.trim();
+  const bridge = join(bbDataDir(opts.hostDataDir, home), "plugins", "provider-pi", "bridge-data", "sessions");
+  return [...new Set([...(override ? [resolve(override)] : []), bridge, legacySessionDir(home)])];
+}
+
+/** A file or folder the worker may not read, as opposed to one that is not there. */
+export const isAccessDenied = (err: unknown): boolean => {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  return code === "EACCES" || code === "EPERM";
+};
 
 /** OMP's native session tree, grouped by working directory. */
 export function ompSessionDir(home = homedir()): string {
@@ -138,7 +161,9 @@ const isMissing = (err: unknown): boolean => (err as NodeJS.ErrnoException).code
  * entries, and later reads parse only the bytes pi appended. A file that shrank
  * or whose first line changed (pi rewrote it) is read again from the start.
  */
-export function createPiSessions(opts: { dir: string; layout?: "pi" | "omp"; limits?: Partial<Limits> }): PiSessions {
+export function createPiSessions(
+  opts: { limits?: Partial<Limits> } & ({ layout?: "pi"; dirs: readonly string[] } | { layout: "omp"; dir: string }),
+): PiSessions {
   const limits: Limits = {
     entriesFileMax: opts.limits?.entriesFileMax ?? ENTRIES_FILE_MAX,
     entriesTotalMax: opts.limits?.entriesTotalMax ?? ENTRIES_TOTAL_MAX,
@@ -157,7 +182,7 @@ export function createPiSessions(opts: { dir: string; layout?: "pi" | "omp"; lim
     if (!warned.has(path)) {
       if (warned.size >= FILES_MAX) warned.clear();
       warned.add(path);
-      console.warn(`[burn] cannot read OMP session path ${path}: ${code}; its sessions may be unavailable`);
+      console.warn(`[burn] cannot read ${opts.layout === "omp" ? "OMP" : "pi"} session path ${path}: ${code}; its sessions may be unavailable`);
     }
     return true;
   }
@@ -221,15 +246,37 @@ export function createPiSessions(opts: { dir: string; layout?: "pi" | "omp"; lim
     return run;
   }
 
-  async function discover(ids: ReadonlySet<string>): Promise<{ found: Map<string, string[]>; incomplete: boolean }> {
+  /**
+   * A pi session's copies, the one bb most likely still writes to first. Newer bb copies an older log
+   * into its bridge folder and appends only there, and an older bb, after a downgrade, appends only to
+   * the old one. So the copy written last comes first, then the larger, then the folder listed first.
+   * A copy that cannot be read gives way to the next one.
+   */
+  async function copiesOf(dirs: readonly string[], id: string, denied: Map<string, unknown>): Promise<string[]> {
+    const found: { path: string; mtimeMs: number; size: number; order: number }[] = [];
+    for (const [order, dir] of dirs.entries()) {
+      const path = sessionFile(dir, id);
+      try {
+        const info = await stat(path);
+        found.push({ path, mtimeMs: info.mtimeMs, size: info.size, order });
+      } catch (err) {
+        files.delete(path);
+        if (!unavailable(path, err)) throw err;
+        if (!isMissing(err) && !denied.has(id)) denied.set(id, err);
+      }
+    }
+    return found.sort((a, b) => b.mtimeMs - a.mtimeMs || b.size - a.size || a.order - b.order).map((c) => c.path);
+  }
+
+  async function discover(root: string, ids: ReadonlySet<string>): Promise<{ found: Map<string, string[]>; incomplete: boolean }> {
     const discovered = new Map<string, string[]>();
     const at = Date.now();
     let incomplete = false;
     try {
-      const projects = await readdir(opts.dir, { withFileTypes: true });
+      const projects = await readdir(root, { withFileTypes: true });
       for (const project of projects) {
         if (!project.isDirectory()) continue;
-        const dir = join(opts.dir, project.name);
+        const dir = join(root, project.name);
         let entries;
         try {
           entries = await readdir(dir, { withFileTypes: true });
@@ -250,7 +297,7 @@ export function createPiSessions(opts: { dir: string; layout?: "pi" | "omp"; lim
         }
       }
     } catch (err) {
-      if (!unavailable(opts.dir, err)) throw err;
+      if (!unavailable(root, err)) throw err;
       incomplete = true;
     }
     // Never cache a partially enumerated tree: later reads must retry the inaccessible buckets.
@@ -267,14 +314,18 @@ export function createPiSessions(opts: { dir: string; layout?: "pi" | "omp"; lim
     return { found: discovered, incomplete };
   }
 
-  async function pathsOf(ids: ReadonlySet<string>): Promise<{ paths: { path: string; id: string }[]; incomplete: boolean }> {
-    if (opts.layout !== "omp") return { paths: [...ids].map((id) => ({ path: sessionFile(opts.dir, id), id })), incomplete: false };
+  async function pathsOf(ids: ReadonlySet<string>, denied: Map<string, unknown>): Promise<{ paths: { path: string; id: string }[]; incomplete: boolean }> {
+    if (opts.layout !== "omp") {
+      const paths = [];
+      for (const id of ids) for (const path of await copiesOf(opts.dirs, id, denied)) paths.push({ path, id });
+      return { paths, incomplete: false };
+    }
     const now = Date.now();
     const missing = new Set([...ids].filter((id) => {
       const cached = ompPaths.get(id);
       return !cached || now < cached.at || now - cached.at >= OMP_DISCOVERY_TTL_MS;
     }));
-    const scan = missing.size > 0 ? await discover(missing) : null;
+    const scan = missing.size > 0 ? await discover(opts.dir, missing) : null;
     const paths = [...ids].flatMap((id) => {
       const cached = ompPaths.get(id);
       const known = scan?.found.get(id) ?? cached?.paths;
@@ -293,15 +344,22 @@ export function createPiSessions(opts: { dir: string; layout?: "pi" | "omp"; lim
       const foundById = new Map<string, FileState>();
       const ids = new Set(sessionIds.filter((id) => opts.layout !== "omp" || OMP_ID.test(id)));
       const missing = new Set<string>();
+      const denied = new Map<string, unknown>();
       let unreadable = false;
       async function collect(paths: { path: string; id: string }[]): Promise<void> {
         for (const { path, id } of paths) {
+          // pi: the first copy that reads is the session; the others are not read or kept.
+          if (opts.layout !== "omp" && foundById.has(id)) {
+            files.delete(path);
+            continue;
+          }
           let state: FileState | null;
           try {
             state = await refresh(path);
           } catch (err) {
-            if (opts.layout === "omp" && unavailable(path, err)) {
+            if (unavailable(path, err)) {
               unreadable = true;
+              if (!isMissing(err) && !denied.has(id)) denied.set(id, err);
               continue;
             }
             throw err;
@@ -318,18 +376,23 @@ export function createPiSessions(opts: { dir: string; layout?: "pi" | "omp"; lim
           }
         }
       }
-      const initial = await pathsOf(ids);
+      const initial = await pathsOf(ids, denied);
       unreadable ||= initial.incomplete;
       await collect(initial.paths);
       if (opts.layout === "omp" && missing.size > 0) {
         // A session can move between project buckets. Rediscover only identities whose path disappeared.
         for (const id of missing) ompPaths.delete(id);
-        const retried = await pathsOf(missing);
+        const retried = await pathsOf(missing, denied);
         unreadable ||= retried.incomplete;
         await collect(retried.paths);
       }
       const found = [...foundById.values()];
-      if (found.length === 0) return null;
+      if (found.length === 0) {
+        // A pi folder this worker may not read could hold the session, so say so rather than report none.
+        const blocked = opts.layout === "omp" ? undefined : [...denied.values()][0];
+        if (blocked !== undefined) throw blocked;
+        return null;
+      }
       const began = (s: FileState): number => {
         const at = Date.parse((s.header as { timestamp?: string } | null)?.timestamp ?? "");
         return Number.isFinite(at) ? at : 0;
@@ -344,6 +407,9 @@ export function createPiSessions(opts: { dir: string; layout?: "pi" | "omp"; lim
       if (opts.layout === "omp" && (unreadable || foundById.size < ids.size)) {
         report.coverage = "partial";
         report.coverageNote = "Partial OMP session history: some recorded sessions are unavailable.";
+      } else if (opts.layout !== "omp" && [...denied.keys()].some((id) => !foundById.has(id))) {
+        report.coverage = "partial";
+        report.coverageNote = "Partial pi session history: Burn may not read some of this thread's session logs.";
       }
       return { report, at: Math.max(...found.map((s) => s.mtimeMs)) };
     },

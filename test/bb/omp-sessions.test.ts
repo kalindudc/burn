@@ -62,7 +62,7 @@ describe("OMP session accounting", () => {
     ]);
     const thread = makeThreadResponse({ id: "thr_aaaaaaaa", providerId: "acp-omp", environmentId: "env_1" });
     const rows = [identityEvent(thread.id, A), requestEvent(thread.id, "delegate", "p/m1"), costEvent(thread.id, 3.05, "USD", A)];
-    const host = experimental_createHostEntryHarness(createHostEntry({ dir: join(s.dir, "pi"), ompDir: s.dir }));
+    const host = experimental_createHostEntryHarness(createHostEntry({ piDirs: () => [join(s.dir, "pi")], ompDir: s.dir }));
     const { bb, harness } = createFakePluginHost({
       pluginId: "burn",
       sdk: {
@@ -114,7 +114,7 @@ describe("OMP session accounting", () => {
     const pi = join(s.dir, "pi");
     mkdirSync(pi);
     writeFileSync(join(pi, "pi_one.jsonl"), line({ type: "session", id: "pi_one" }) + line(assistant(4)));
-    const host = experimental_createHostEntryHarness(createHostEntry({ dir: pi, ompDir: s.dir, watchWaitMs: 0 }));
+    const host = experimental_createHostEntryHarness(createHostEntry({ piDirs: () => [pi], ompDir: s.dir, watchWaitMs: 0 }));
     chmodSync(blocked, 0);
     try {
       const got = await host.experimental_call("reports", { harness: "omp", timeZone: "UTC", threads: [{ threadId: "thr_aaaaaaaa", sessionIds: [A, B] }] });
@@ -289,7 +289,7 @@ describe("OMP session accounting", () => {
     const missing = s.write(B, [assistant(2)]);
     const thread = makeThreadResponse({ id: "thr_aaaaaaaa", providerId: "acp-omp", environmentId: "env_1", status: "active" });
     const rows = [identityEvent(thread.id, A), identityEvent(thread.id, B)];
-    const host = experimental_createHostEntryHarness(createHostEntry({ dir: join(s.dir, "pi"), ompDir: s.dir }));
+    const host = experimental_createHostEntryHarness(createHostEntry({ piDirs: () => [join(s.dir, "pi")], ompDir: s.dir }));
     const { bb, harness } = createFakePluginHost({
       pluginId: "burn",
       sdk: {
@@ -343,7 +343,7 @@ describe("OMP session accounting", () => {
     const path = s.write(A, [user("inspect"), assistant(1), assistant(2)]);
     const thread = makeThreadResponse({ id: "thr_aaaaaaaa", providerId: "acp-omp", environmentId: "env_1", status: "active" });
     const rows = [identityEvent(thread.id, A), requestEvent(thread.id, "inspect", "p/m1"), costEvent(thread.id, 3, "USD", A)];
-    const host = experimental_createHostEntryHarness(createHostEntry({ dir: join(s.dir, "pi"), ompDir: s.dir }));
+    const host = experimental_createHostEntryHarness(createHostEntry({ piDirs: () => [join(s.dir, "pi")], ompDir: s.dir }));
     const { bb, harness } = createFakePluginHost({
       pluginId: "burn",
       sdk: {

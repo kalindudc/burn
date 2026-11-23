@@ -18,13 +18,16 @@ const HARNESSES: Readonly<Record<string, Harness>> = {
   pi: { reader: "pi-log", prices: null, cacheInInput: false, perCall: true },
   "acp-omp": { reader: "omp-log", prices: null, cacheInInput: false, perCall: true },
   "acp-opencode": { reader: "opencode-db", prices: null, cacheInInput: false, perCall: true },
+  // bb-plugin-opencode2 runs OpenCode v2 itself and keeps the same database
+  // (session_message / session_v2), which the opencode-db reader already reads.
+  opencode2: { reader: "opencode-db", prices: null, cacheInInput: false, perCall: true },
   codex: { reader: "events", prices: OPENAI_CODEX_PRICES, cacheInInput: true, perCall: true, separateChildCounters: true },
   "claude-code": { reader: "claude-log", prices: ANTHROPIC_PRICES, cacheInInput: false, perCall: false },
 };
 
 const OTHER: Harness = { reader: "events", prices: null, cacheInInput: null, perCall: false };
 
-const NAMES: Readonly<Record<string, string>> = { pi: "pi", "acp-omp": "OMP", "acp-opencode": "OpenCode", codex: "Codex", "claude-code": "Claude Code" };
+const NAMES: Readonly<Record<string, string>> = { pi: "pi", "acp-omp": "OMP", "acp-opencode": "OpenCode", opencode2: "OpenCode v2", codex: "Codex", "claude-code": "Claude Code" };
 
 /** A bb provider's name for people; one Burn does not know reads as its id. */
 export const harnessName = (providerId: string): string => (Object.hasOwn(NAMES, providerId) ? (NAMES[providerId] as string) : providerId);

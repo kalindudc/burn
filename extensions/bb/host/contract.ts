@@ -16,10 +16,10 @@ const threadId = z.string().regex(THREAD_ID);
 export const hostContract = defineRpcContract({
   reports: {
     input: z.object({
-      harness: z.enum(["pi", "omp", "opencode", "claude"]),
+      harness: z.enum(["pi", "omp", "opencode", "claude", "antigravity"]),
       /** The bb server's IANA zone, so `days` are its local days whatever the host's zone. */
       timeZone: z.string().max(100),
-      /** Burn's price overrides from settings, for the Claude reader, which prices tokens itself. */
+      /** Burn's price overrides from settings, for the Claude and Antigravity readers, which price tokens themselves. */
       prices: z
         .record(
           z.string().max(200),

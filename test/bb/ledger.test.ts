@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { harnessOf } from "../../extensions/bb/harnesses.js";
+import { harnessName, harnessOf } from "../../extensions/bb/harnesses.js";
 import { addRows, type EventRow, ledgerEntries, newLedger, splitTokens, type Totals } from "../../extensions/bb/ledger.js";
 import { isTokenOnly } from "../../src/format.js";
 import { ANTHROPIC_PRICES, OPENAI_CODEX_PRICES } from "../../src/prices.js";
@@ -24,6 +24,8 @@ describe("harnessOf", () => {
     expect(harnessOf("pi")).toEqual({ reader: "pi-log", prices: null, cacheInInput: false, perCall: true });
     expect(harnessOf("codex")).toEqual({ reader: "events", prices: OPENAI_CODEX_PRICES, cacheInInput: true, perCall: true, separateChildCounters: true });
     expect(harnessOf("claude-code")).toEqual({ reader: "claude-log", prices: ANTHROPIC_PRICES, cacheInInput: false, perCall: false });
+    expect(harnessOf("acp-antigravity")).toEqual({ reader: "antigravity-log", prices: {}, cacheInInput: false, perCall: true });
+    expect(harnessName("acp-antigravity")).toBe("Antigravity");
     expect(harnessOf("acp-cursor")).toEqual({ reader: "events", prices: null, cacheInInput: null, perCall: false });
     expect(harnessOf("constructor")).toEqual(harnessOf("acp-cursor"));
   });

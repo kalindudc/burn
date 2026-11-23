@@ -31,7 +31,7 @@ type Thread = { host: string | null; provider?: string; status?: "active" | "idl
 /** A source over fake threads; each host answers with `costs[threadId]`, or throws when listed in `offline`. */
 function setup(
   threads: Record<string, Thread>,
-  opts: { offline?: string[]; disconnected?: string[]; listFails?: boolean; directory?: boolean; coverageNote?: string; retryMs?: number; retryMax?: number; hostWaitStepsMs?: number[]; denied?: Set<string>; searched?: string[]; sessionFileOf?: (threadId: string) => Promise<string | null> } = {},
+  opts: { offline?: string[]; disconnected?: string[]; listFails?: boolean; directory?: boolean; coverageNote?: string; retryMs?: number; retryMax?: number; hostWaitStepsMs?: number[]; denied?: Set<string>; searched?: string[]; sessionFileOf?: (threadId: string) => Promise<string | null>; overrides?: () => Record<string, { input: number; output: number; cacheRead: number; cacheWrite: number }> } = {},
 ) {
   const costs: Record<string, number> = {};
   const rows: EventRow[] = [];
@@ -141,6 +141,7 @@ function setup(
     ...(opts.retryMax === undefined ? {} : { retryMax: opts.retryMax }),
     ...(opts.hostWaitStepsMs === undefined ? {} : { hostWaitStepsMs: opts.hostWaitStepsMs }),
     ...(opts.sessionFileOf === undefined ? {} : { sessionFileOf: opts.sessionFileOf }),
+    ...(opts.overrides === undefined ? {} : { overrides: opts.overrides }),
   });
   const asked = (hostId?: string) =>
     calls
@@ -520,6 +521,35 @@ describe("createReportSource", () => {
     expect(s.asked().at(-1)).toEqual([id(1)]);
     expect(await s.cost(id(2))).toEqual([1]);
     expect(s.calls).toHaveLength(before + 1);
+  });
+
+  it("asks the host for an Antigravity thread with its providerThreadId and priceOverrides, and refreshes on events and idle", async () => {
+    const prices = { "gemini-4-hydrogen-high": { input: 1.5, output: 7.5, cacheRead: 0.075, cacheWrite: 0 } };
+    const s = setup(
+      { [id(1)]: { host: A, provider: "acp-antigravity", sessions: ["1f103e41-c956-49f8-aa67-795c095fa3a7"] } },
+      { overrides: () => prices },
+    );
+    s.costs[id(1)] = 3;
+    expect(await s.cost(id(1))).toEqual([3]);
+    expect(s.calls[0]?.input).toMatchObject({
+      harness: "antigravity",
+      prices,
+      threads: [{ threadId: id(1), sessionIds: ["1f103e41-c956-49f8-aa67-795c095fa3a7", id(1)] }],
+    });
+    expect(await s.source.harnessOf(id(1))).toMatchObject({ reader: "antigravity-log", cacheInInput: false, perCall: true });
+    s.costs[id(1)] = 5;
+    await s.harness.behavior.emitThreadEvent("experimental_thread.events", {
+      thread: makeThreadResponse({ id: id(1), providerId: "acp-antigravity" }),
+      sequence: 2,
+    });
+    expect(s.changed).toEqual([[id(1)]]);
+    expect(await s.cost(id(1))).toEqual([5]);
+    s.costs[id(1)] = 6;
+    await s.harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: id(1), providerId: "acp-antigravity", status: "idle" }),
+      lastAssistantText: null,
+    });
+    expect(await s.cost(id(1))).toEqual([6]);
   });
 
   it("reads a thread of another provider again when bb says it went idle", async () => {

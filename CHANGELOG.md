@@ -4,6 +4,10 @@ Notable changes to Burn, newest first.
 
 Burn follows [semantic versioning](https://semver.org). Releases from 0.4.0 on are tagged `vX.Y.Z` in this repository; earlier versions were not tagged. Each release's commit message has the full detail, including how the release was checked.
 
+## Unreleased
+
+- Read Antigravity (`acp-antigravity`) usage from local `agy` `transcript.jsonl` logs on the thread's machine, estimating cost from `models.dev` (matching model names without effort suffixes) with Burn's `priceOverrides` as fallback, or showing tokens when unpriced. ([#25](https://github.com/kalindudc/burn/issues/25))
+
 ## 0.11.2 - 2026-11-21
 
 Burn now says when it cannot find a pi thread's session log, instead of waiting for a first model call that already happened. The Burn pi extension tells Burn where its log is, and every pull request and release is checked first.

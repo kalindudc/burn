@@ -3,6 +3,7 @@ import { basename, dirname, join } from "node:path";
 import type { ExperimentalHostRpcContext, ExperimentalHostWatchEvent, ExperimentalHostWatchSubscription } from "@get-bb/plugin-sdk";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { CHANGED_MAX, hostContract, hostSignals } from "./contract.js";
+import { antigravityBrainDir, createAntigravitySessions } from "./antigravity-sessions.js";
 import { createClaudeSessions, claudeProjectsDir } from "./claude-sessions.js";
 import { createOpencodeDb, opencodeDbPath } from "./opencode-db.js";
 import { createPiSessions, hintedDir, isAccessDenied, ompSessionDir, piSessionDirs, type PiSessions } from "./pi-sessions.js";
@@ -48,8 +49,11 @@ export function createHostEntry(opts: {
   opencodeModels?: string;
   watchWaitMs?: number;
   claudeDir?: string;
+  antigravityDir?: string;
 } = {}) {
   const claude = createClaudeSessions({ dir: opts.claudeDir ?? claudeProjectsDir() });
+  const antigravityDir = opts.antigravityDir ?? antigravityBrainDir();
+  const antigravity = createAntigravitySessions({ dir: antigravityDir, modelsPath: opts.opencodeModels });
   const locate = opts.piDirs ?? ((hostDataDir) => piSessionDirs({ hostDataDir }));
   let pi: { dirs: readonly string[]; sessions: PiSessions } | null = null;
   const ompDir = opts.ompDir ?? ompSessionDir();
@@ -157,6 +161,7 @@ export function createHostEntry(opts: {
           try {
             got = harness === "claude"
                 ? await claude.reportOf(sessionIds, timeZone, { since, parentSessionIds, prices })
+                : harness === "antigravity" ? await antigravity.reportOf(sessionIds, timeZone, { prices })
                 : harness === "opencode" ? await opencode.reportOf(sessionIds, timeZone)
                 : harness === "omp" ? await omp.reportOf(sessionIds, timeZone) : await piOf(context).sessions.reportOf(sessionIds, timeZone, elsewhere);
           } catch (err) {
@@ -180,7 +185,7 @@ export function createHostEntry(opts: {
           }
           reports.push({ threadId, report: parsed?.success ? parsed.data : null, at: parsed?.success ? (got?.at ?? null) : null, ...unwatched });
         }
-        return { dir: harness === "omp" ? ompDir : piOf(context).dirs.join(", "), reports };
+        return { dir: harness === "omp" ? ompDir : harness === "antigravity" ? antigravityDir : piOf(context).dirs.join(", "), reports };
       },
     },
   });

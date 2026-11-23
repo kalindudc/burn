@@ -589,13 +589,13 @@ export function createReportSource(
 
   async function ask(
     hostId: string,
-    harness: "pi" | "omp" | "opencode" | "claude",
+    harness: "pi" | "omp" | "opencode" | "claude" | "antigravity",
     threadIds: string[],
     answers: Map<string, LogReport | null>,
   ): Promise<void> {
     const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    // Only the Claude reader prices tokens from this table; pi and opencode record their own cost.
-    const prices = harness === "claude" ? (opts.overrides?.() ?? {}) : {};
+    // Only the Claude and Antigravity readers price tokens from this table; pi and opencode record their own cost.
+    const prices = harness === "claude" || harness === "antigravity" ? (opts.overrides?.() ?? {}) : {};
     for (let start = 0; start < threadIds.length; start += HOST_BATCH) {
       const batch = threadIds.slice(start, start + HOST_BATCH);
       // Taken before anything awaits, so news that arrives meanwhile, such as a new session file, outdates this read.
@@ -621,11 +621,11 @@ export function createReportSource(
             threads: batch.map((threadId) => ({
               threadId,
               sessionIds: facts.get(threadId)?.sessionIds ?? [threadId],
-              ...(harness === "claude" && facts.get(threadId)?.since !== undefined ? { since: facts.get(threadId)!.since! } : {}),
-              ...(harness === "claude" && facts.get(threadId)?.parentSessionIds !== undefined ? { parentSessionIds: facts.get(threadId)!.parentSessionIds! } : {}),
-              ...(hints.has(threadId) ? { sessionFile: hints.get(threadId)! } : {}),
-            })),
-            ...(harness === "claude" && Object.keys(prices).length > 0 ? { prices } : {}),
+            ...(harness === "claude" && facts.get(threadId)?.since !== undefined ? { since: facts.get(threadId)!.since! } : {}),
+            ...(harness === "claude" && facts.get(threadId)?.parentSessionIds !== undefined ? { parentSessionIds: facts.get(threadId)!.parentSessionIds! } : {}),
+            ...(hints.has(threadId) ? { sessionFile: hints.get(threadId)! } : {}),
+          })),
+          ...((harness === "claude" || harness === "antigravity") && Object.keys(prices).length > 0 ? { prices } : {}),
           },
           { hostId, timeoutMs: HOST_TIMEOUT_MS },
         );
@@ -636,7 +636,16 @@ export function createReportSource(
         if (failure === undefined) failures.set(hostId, { at, delay: HOST_RETRY_MS });
         else if (at - failure.at >= failure.delay) failures.set(hostId, { at, delay: Math.min(failure.delay * 2, HOST_RETRY_MAX_MS) });
         if (failure === undefined) {
-          const what = harness === "claude" ? "Claude transcripts" : harness === "omp" ? "OMP session logs" : harness === "pi" ? "pi session logs" : "opencode's database";
+          const what =
+            harness === "claude"
+              ? "Claude transcripts"
+              : harness === "antigravity"
+                ? "Antigravity transcripts"
+                : harness === "omp"
+                  ? "OMP session logs"
+                  : harness === "pi"
+                    ? "pi session logs"
+                    : "opencode's database";
           bb.log.warn(`reading ${what} on ${hostId} failed, so Burn shows the last figures it read there and asks again after a growing wait: ${message(err)}`);
         }
         return;
@@ -659,14 +668,14 @@ export function createReportSource(
         if (gen === priceGeneration && got?.report.coverage === "partial") {
           const kept = await lastKept(threadId);
           // A session log is only ever appended to, so for pi and OMP a saved report with more spend is the fuller one.
-          if (kept && (harness === "claude" ? kept.report.coverage !== "partial" : kept.report.cost.total > got.report.cost.total)) {
-            const what = harness === "omp" ? "OMP" : harness === "pi" ? "pi" : "Claude";
+          if (kept && (harness === "claude" || harness === "antigravity" ? kept.report.coverage !== "partial" : kept.report.cost.total > got.report.cost.total)) {
+            const what = harness === "omp" ? "OMP" : harness === "pi" ? "pi" : harness === "antigravity" ? "Antigravity" : "Claude";
             got = {
               ...kept,
               report: {
                 ...kept.report,
                 coverage: "partial",
-                coverageNote: `Partial latest ${what} history: showing the last saved ${harness === "claude" ? "transcript" : "session"} report.`,
+                coverageNote: `Partial latest ${what} history: showing the last saved ${harness === "claude" || harness === "antigravity" ? "transcript" : "session"} report.`,
               },
             };
           }
@@ -710,7 +719,7 @@ export function createReportSource(
     const reader = harnessOf(thread.providerId).reader;
     if (reader === "events") events.invalidate(thread.id);
     // These readers have no filesystem watch; read again after the provider finishes.
-    else if (reader === "opencode-db" || reader === "claude-log" || reader === "omp-log") {
+    else if (reader === "opencode-db" || reader === "claude-log" || reader === "omp-log" || reader === "antigravity-log") {
       invalidate(thread.id);
       if (reader === "claude-log" || reader === "omp-log") events.invalidate(thread.id);
     }
@@ -732,7 +741,7 @@ export function createReportSource(
   for (const name of ["thread.idle", "thread.failed"] as const) bb.events.on(name, ({ thread }) => heardStatus(thread));
   // BB records events at most once a second; refresh readers without a filesystem watch while they work.
   bb.events.on("experimental_thread.events", ({ thread }) => {
-    if (!["opencode-db", "claude-log", "omp-log"].includes(harnessOf(thread.providerId).reader)) return;
+    if (!["opencode-db", "claude-log", "omp-log", "antigravity-log"].includes(harnessOf(thread.providerId).reader)) return;
     invalidate(thread.id);
     opts.onChange([thread.id]);
   });
@@ -764,7 +773,7 @@ export function createReportSource(
       });
       const factsInTime = await settlesBy(factsRun, until);
       // Nothing below awaits until every read is registered, so two callers never ask a host for the same thread.
-      const wanted = new Map<string, { hostId: string; harness: "pi" | "omp" | "opencode" | "claude"; threadIds: string[] }>();
+      const wanted = new Map<string, { hostId: string; harness: "pi" | "omp" | "opencode" | "claude" | "antigravity"; threadIds: string[] }>();
       for (const { threadId, hostId, providerId } of looked) {
         if (fresh(threadId)) continue;
         const reader = providerId === null ? null : harnessOf(providerId).reader;
@@ -778,7 +787,16 @@ export function createReportSource(
           continue;
         }
         if (hostId === null || !hosts.connected(hostId) || hostDown(hostId)) continue;
-        const harness = reader === "claude-log" ? "claude" : reader === "omp-log" ? "omp" : reader === "opencode-db" ? "opencode" : "pi";
+        const harness =
+          reader === "claude-log"
+            ? "claude"
+            : reader === "antigravity-log"
+              ? "antigravity"
+              : reader === "omp-log"
+                ? "omp"
+                : reader === "opencode-db"
+                  ? "opencode"
+                  : "pi";
         const key = `${hostId}:${harness}`;
         const group = wanted.get(key) ?? { hostId, harness, threadIds: [] };
         group.threadIds.push(threadId);

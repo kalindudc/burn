@@ -1356,6 +1356,29 @@ describe("Claude transcript source selection", () => {
   });
 });
 
+describe("OpenCode v2 event fallback", () => {
+  it("falls back to BB usage events when the database is unavailable or returns nothing", async () => {
+    const s = setup({ [id(1)]: { host: A, provider: "opencode2" } }, { disconnected: [A] });
+    s.rows.push(requestEvent(id(1), "go", "opencode-go/glm-5.3-flash"), usageEvent(id(1), CODEX_1));
+    const offline = (await s.source.reportsOf([id(1)])).get(id(1));
+    expect(offline?.source).toBe("events");
+    expect(offline?.report.coverage).toBe("partial");
+    expect(offline?.report.coverageNote).toContain("Limited coverage: OpenCode's database is unavailable");
+    expect(offline?.report.calls).toBe(1);
+    expect(offline!.report.tokens.input + offline!.report.tokens.output + offline!.report.tokens.cacheRead).toBeGreaterThan(0);
+    await s.harness.lifecycle.dispose();
+
+    // Connected host whose OpenCode database returns null also falls back to BB events.
+    const s2 = setup({ [id(2)]: { host: A, provider: "opencode2" } });
+    s2.rows.push(requestEvent(id(2), "go", "opencode-go/glm-5.3-flash"), usageEvent(id(2), CODEX_1));
+    const emptyDb = (await s2.source.reportsOf([id(2)])).get(id(2));
+    expect(emptyDb?.source).toBe("events");
+    expect(emptyDb?.report.coverage).toBe("partial");
+    expect(emptyDb?.report.calls).toBe(1);
+    await s2.harness.lifecycle.dispose();
+  });
+});
+
 it("keeps a saved pi report with more spend over a partial one, also once the host is offline", async () => {
   const opts: { coverageNote?: string; offline?: string[] } = {};
   const s = setup({ [id(1)]: { host: A } }, opts);

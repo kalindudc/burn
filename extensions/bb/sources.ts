@@ -712,7 +712,7 @@ export function createReportSource(
     // These readers have no filesystem watch; read again after the provider finishes.
     else if (reader === "opencode-db" || reader === "claude-log" || reader === "omp-log") {
       invalidate(thread.id);
-      if (reader === "claude-log" || reader === "omp-log") events.invalidate(thread.id);
+      if (reader === "claude-log" || reader === "omp-log" || thread.providerId === "opencode2") events.invalidate(thread.id);
     }
     opts.onChange([thread.id]);
   }
@@ -734,6 +734,7 @@ export function createReportSource(
   bb.events.on("experimental_thread.events", ({ thread }) => {
     if (!["opencode-db", "claude-log", "omp-log"].includes(harnessOf(thread.providerId).reader)) return;
     invalidate(thread.id);
+    if (thread.providerId === "opencode2") events.invalidate(thread.id);
     opts.onChange([thread.id]);
   });
 
@@ -819,7 +820,11 @@ export function createReportSource(
           ? { ...kept, report: { ...kept.report, coverage: "partial" as const, coverageNote: "Burn can no longer find this thread's pi session log, so these are the last figures it read." } }
           : kept;
         if (best) out.set(threadId, best);
-        else if (facts.get(threadId)?.providerId === "claude-code" || facts.get(threadId)?.providerId === "acp-omp") {
+        else if (
+          facts.get(threadId)?.providerId === "claude-code" ||
+          facts.get(threadId)?.providerId === "acp-omp" ||
+          facts.get(threadId)?.providerId === "opencode2"
+        ) {
           const providerId = facts.get(threadId)!.providerId!;
           const fallback = await events.reportOf(threadId, providerId);
           if (fallback)
@@ -829,9 +834,12 @@ export function createReportSource(
               report: {
                 ...fallback.report,
                 coverage: "partial",
-                coverageNote: providerId === "acp-omp"
-                  ? "Limited coverage: OMP session logs are unavailable. Only BB's recorded usage is shown; model calls, tokens and timing may be missing."
-                  : "Limited coverage: saved history is unavailable; some subagent usage and earlier turns may be missing.",
+                coverageNote:
+                  providerId === "acp-omp"
+                    ? "Limited coverage: OMP session logs are unavailable. Only BB's recorded usage is shown; model calls, tokens and timing may be missing."
+                    : providerId === "opencode2"
+                      ? "Limited coverage: OpenCode's database is unavailable. Only BB's recorded usage is shown; model calls, cost and child sessions may be missing."
+                      : "Limited coverage: saved history is unavailable; some subagent usage and earlier turns may be missing.",
               },
             });
         }

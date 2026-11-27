@@ -3,6 +3,7 @@ import { basename, dirname, join } from "node:path";
 import type { ExperimentalHostRpcContext, ExperimentalHostWatchEvent, ExperimentalHostWatchSubscription } from "@get-bb/plugin-sdk";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { CHANGED_MAX, hostContract, hostSignals } from "./contract.js";
+import { antigravityBrainDir, createAntigravitySessions } from "./antigravity-sessions.js";
 import { createClaudeSessions, claudeProjectsDir } from "./claude-sessions.js";
 import { createOpencodeDb, opencodeDbPath } from "./opencode-db.js";
 import { createPiSessions, hintedDir, isAccessDenied, ompSessionDir, piSessionDirs, type PiSessions } from "./pi-sessions.js";
@@ -48,7 +49,10 @@ export function createHostEntry(opts: {
   opencodeModels?: string;
   watchWaitMs?: number;
   claudeDir?: string;
+  antigravityDir?: string;
 } = {}) {
+  const agyDir = opts.antigravityDir ?? antigravityBrainDir();
+  const antigravity = createAntigravitySessions(agyDir);
   const claude = createClaudeSessions({ dir: opts.claudeDir ?? claudeProjectsDir() });
   const locate = opts.piDirs ?? ((hostDataDir) => piSessionDirs({ hostDataDir }));
   let pi: { dirs: readonly string[]; sessions: PiSessions } | null = null;
@@ -155,13 +159,13 @@ export function createHostEntry(opts: {
           const unwatched = elsewhere === undefined ? {} : { unwatched: true };
           let got;
           try {
-            got = harness === "claude"
-                ? await claude.reportOf(sessionIds, timeZone, { since, parentSessionIds, prices })
+            got = harness === "antigravity" || harness === "claude"
+                ? await (harness === "antigravity" ? antigravity : claude).reportOf(sessionIds, timeZone, { since, parentSessionIds, prices })
                 : harness === "opencode" ? await opencode.reportOf(sessionIds, timeZone)
                 : harness === "omp" ? await omp.reportOf(sessionIds, timeZone) : await piOf(context).sessions.reportOf(sessionIds, timeZone, elsewhere);
           } catch (err) {
             // A log this worker may not read costs only its own thread, which keeps its last figures.
-            if (harness !== "pi" || !isAccessDenied(err)) throw err;
+            if (harness !== "antigravity" && (harness !== "pi" || !isAccessDenied(err))) throw err;
             reports.push({ threadId, report: null, at: null, error: String((err as Error).message ?? err).slice(0, 500), ...unwatched });
             continue;
           }
@@ -180,7 +184,7 @@ export function createHostEntry(opts: {
           }
           reports.push({ threadId, report: parsed?.success ? parsed.data : null, at: parsed?.success ? (got?.at ?? null) : null, ...unwatched });
         }
-        return { dir: harness === "omp" ? ompDir : piOf(context).dirs.join(", "), reports };
+        return { dir: harness === "antigravity" ? agyDir : harness === "omp" ? ompDir : piOf(context).dirs.join(", "), reports };
       },
     },
   });

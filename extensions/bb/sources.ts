@@ -4,12 +4,19 @@ import type { PriceOverrides } from "../../src/prices.js";
 import type { UsageReport } from "../../src/report.js";
 import type { ThreadDirectory } from "./directory.js";
 import { createEventReader } from "./events.js";
-import { type Harness, harnessOf } from "./harnesses.js";
+import { type Harness, type HostHarness, harnessOf, hostReaders } from "./harnesses.js";
 import { HOST_BATCH, hostContract, hostSignals } from "./host/contract.js";
 import { createHostWatch } from "./hosts.js";
 import { sessionStem } from "./host/pi-sessions.js";
 import { logKey } from "./keys.js";
 import { usageReportSchema } from "./schema.js";
+
+const partialEventNotes: Readonly<Record<string, string>> = {
+  "acp-omp": "Limited coverage: OMP session logs are unavailable. Only BB's recorded usage is shown; model calls, tokens and timing may be missing.",
+  "opencode2": "Limited coverage: OpenCode's database is unavailable. Only BB's recorded usage is shown; model calls, cost and child sessions may be missing.",
+  "claude-code": "Limited coverage: saved history is unavailable; some subagent usage and earlier turns may be missing.",
+  "antigravity-plus": "Antigravity transcripts are unavailable. Showing usage recorded by BB.",
+};
 
 const FACTS_TTL_MS = 5 * 60_000;
 /** A thread whose pi session id bb has not named yet is looked up again this soon, not after the full facts TTL. */
@@ -368,7 +375,7 @@ export function createReportSource(
     // Only pi's bridge names its session files after these ids.
     const stems = reader === "pi-log" ? new Set(sessionIds.map(sessionStem)) : new Set<string>();
     let parentSessionIds: string[] | undefined;
-    if (reader === "claude-log" && row.sourceThreadId) {
+    if ((reader === "claude-log" || reader === "antigravity-log") && row.sourceThreadId) {
       parentSessionIds = [...new Set(await identitiesOf(row.sourceThreadId))].slice(-SESSIONS_MAX);
     }
     return { at: now(), hostId, providerId: row.providerId, sessionIds, identified: identities.length > 0, stems, since: row.since, parentSessionIds };
@@ -589,13 +596,13 @@ export function createReportSource(
 
   async function ask(
     hostId: string,
-    harness: "pi" | "omp" | "opencode" | "claude",
+    harness: HostHarness,
     threadIds: string[],
     answers: Map<string, LogReport | null>,
   ): Promise<void> {
     const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    // Only the Claude reader prices tokens from this table; pi and opencode record their own cost.
-    const prices = harness === "claude" ? (opts.overrides?.() ?? {}) : {};
+    const pricedTranscript = harness === "claude" || harness === "antigravity";
+    const prices = pricedTranscript ? (opts.overrides?.() ?? {}) : {};
     for (let start = 0; start < threadIds.length; start += HOST_BATCH) {
       const batch = threadIds.slice(start, start + HOST_BATCH);
       // Taken before anything awaits, so news that arrives meanwhile, such as a new session file, outdates this read.
@@ -621,11 +628,11 @@ export function createReportSource(
             threads: batch.map((threadId) => ({
               threadId,
               sessionIds: facts.get(threadId)?.sessionIds ?? [threadId],
-              ...(harness === "claude" && facts.get(threadId)?.since !== undefined ? { since: facts.get(threadId)!.since! } : {}),
-              ...(harness === "claude" && facts.get(threadId)?.parentSessionIds !== undefined ? { parentSessionIds: facts.get(threadId)!.parentSessionIds! } : {}),
+              ...(pricedTranscript && facts.get(threadId)?.since !== undefined ? { since: facts.get(threadId)!.since! } : {}),
+              ...(pricedTranscript && facts.get(threadId)?.parentSessionIds !== undefined ? { parentSessionIds: facts.get(threadId)!.parentSessionIds! } : {}),
               ...(hints.has(threadId) ? { sessionFile: hints.get(threadId)! } : {}),
             })),
-            ...(harness === "claude" && Object.keys(prices).length > 0 ? { prices } : {}),
+            ...(Object.keys(prices).length > 0 ? { prices } : {}),
           },
           { hostId, timeoutMs: HOST_TIMEOUT_MS },
         );
@@ -636,7 +643,7 @@ export function createReportSource(
         if (failure === undefined) failures.set(hostId, { at, delay: HOST_RETRY_MS });
         else if (at - failure.at >= failure.delay) failures.set(hostId, { at, delay: Math.min(failure.delay * 2, HOST_RETRY_MAX_MS) });
         if (failure === undefined) {
-          const what = harness === "claude" ? "Claude transcripts" : harness === "omp" ? "OMP session logs" : harness === "pi" ? "pi session logs" : "opencode's database";
+          const what = harness === "antigravity" ? "Antigravity transcripts" : harness === "claude" ? "Claude transcripts" : harness === "omp" ? "OMP session logs" : harness === "pi" ? "pi session logs" : "opencode's database";
           bb.log.warn(`reading ${what} on ${hostId} failed, so Burn shows the last figures it read there and asks again after a growing wait: ${message(err)}`);
         }
         return;
@@ -646,7 +653,7 @@ export function createReportSource(
         const current = gen === priceGeneration && (versions.get(threadId) ?? 0) === seen.get(threadId);
         if (error !== undefined && !deniedHosts.has(hostId)) {
           remember(deniedHosts, hostId, true);
-          bb.log.warn(`reading the pi session log of ${threadId} on ${hostId} failed, so Burn shows the last figures it read for threads it cannot read there: ${error}`);
+          bb.log.warn(`reading the ${harness} session log of ${threadId} on ${hostId} failed, so Burn shows the last figures it read for threads it cannot read there: ${error}`);
         }
         if (harness === "pi" && current) {
           if (unwatched) remember(unwatchedThreads, threadId, true);
@@ -656,7 +663,7 @@ export function createReportSource(
           else if (report !== null) missing.delete(threadId);
         }
         let got: LogReport | null = report !== null && at !== null ? { report, at, source: "log" } : null;
-        if (gen === priceGeneration && got?.report.coverage === "partial") {
+        if (harness !== "antigravity" && gen === priceGeneration && got?.report.coverage === "partial") {
           const kept = await lastKept(threadId);
           // A session log is only ever appended to, so for pi and OMP a saved report with more spend is the fuller one.
           if (kept && (harness === "claude" ? kept.report.coverage !== "partial" : kept.report.cost.total > got.report.cost.total)) {
@@ -710,9 +717,9 @@ export function createReportSource(
     const reader = harnessOf(thread.providerId).reader;
     if (reader === "events") events.invalidate(thread.id);
     // These readers have no filesystem watch; read again after the provider finishes.
-    else if (reader === "opencode-db" || reader === "claude-log" || reader === "omp-log") {
+    else if (reader !== "pi-log") {
       invalidate(thread.id);
-      if (reader === "claude-log" || reader === "omp-log" || thread.providerId === "opencode2") events.invalidate(thread.id);
+      if (reader !== "opencode-db" || thread.providerId === "opencode2") events.invalidate(thread.id);
     }
     opts.onChange([thread.id]);
   }
@@ -732,7 +739,8 @@ export function createReportSource(
   for (const name of ["thread.idle", "thread.failed"] as const) bb.events.on(name, ({ thread }) => heardStatus(thread));
   // BB records events at most once a second; refresh readers without a filesystem watch while they work.
   bb.events.on("experimental_thread.events", ({ thread }) => {
-    if (!["opencode-db", "claude-log", "omp-log"].includes(harnessOf(thread.providerId).reader)) return;
+    const reader = harnessOf(thread.providerId).reader;
+    if (reader === "events" || reader === "pi-log") return;
     invalidate(thread.id);
     if (thread.providerId === "opencode2") events.invalidate(thread.id);
     opts.onChange([thread.id]);
@@ -765,7 +773,7 @@ export function createReportSource(
       });
       const factsInTime = await settlesBy(factsRun, until);
       // Nothing below awaits until every read is registered, so two callers never ask a host for the same thread.
-      const wanted = new Map<string, { hostId: string; harness: "pi" | "omp" | "opencode" | "claude"; threadIds: string[] }>();
+      const wanted = new Map<string, { hostId: string; harness: HostHarness; threadIds: string[] }>();
       for (const { threadId, hostId, providerId } of looked) {
         if (fresh(threadId)) continue;
         const reader = providerId === null ? null : harnessOf(providerId).reader;
@@ -779,7 +787,8 @@ export function createReportSource(
           continue;
         }
         if (hostId === null || !hosts.connected(hostId) || hostDown(hostId)) continue;
-        const harness = reader === "claude-log" ? "claude" : reader === "omp-log" ? "omp" : reader === "opencode-db" ? "opencode" : "pi";
+        if (!reader || reader === "events") continue;
+        const harness = hostReaders[reader];
         const key = `${hostId}:${harness}`;
         const group = wanted.get(key) ?? { hostId, harness, threadIds: [] };
         group.threadIds.push(threadId);
@@ -820,11 +829,7 @@ export function createReportSource(
           ? { ...kept, report: { ...kept.report, coverage: "partial" as const, coverageNote: "Burn can no longer find this thread's pi session log, so these are the last figures it read." } }
           : kept;
         if (best) out.set(threadId, best);
-        else if (
-          facts.get(threadId)?.providerId === "claude-code" ||
-          facts.get(threadId)?.providerId === "acp-omp" ||
-          facts.get(threadId)?.providerId === "opencode2"
-        ) {
+        else if (Object.hasOwn(partialEventNotes, facts.get(threadId)?.providerId ?? "")) {
           const providerId = facts.get(threadId)!.providerId!;
           const fallback = await events.reportOf(threadId, providerId);
           if (fallback)
@@ -834,12 +839,7 @@ export function createReportSource(
               report: {
                 ...fallback.report,
                 coverage: "partial",
-                coverageNote:
-                  providerId === "acp-omp"
-                    ? "Limited coverage: OMP session logs are unavailable. Only BB's recorded usage is shown; model calls, tokens and timing may be missing."
-                    : providerId === "opencode2"
-                      ? "Limited coverage: OpenCode's database is unavailable. Only BB's recorded usage is shown; model calls, cost and child sessions may be missing."
-                      : "Limited coverage: saved history is unavailable; some subagent usage and earlier turns may be missing.",
+                coverageNote: partialEventNotes[providerId],
               },
             });
         }

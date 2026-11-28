@@ -59,6 +59,8 @@ export interface LogReport {
   report: UsageReport;
   at: number;
   source: "log" | "events";
+  /** The last saved report, not corroborated by this read. */
+  stale?: true;
 }
 
 export interface ReportSource {
@@ -828,7 +830,7 @@ export function createReportSource(
         const best = lost
           ? { ...kept, report: { ...kept.report, coverage: "partial" as const, coverageNote: "Burn can no longer find this thread's pi session log, so these are the last figures it read." } }
           : kept;
-        if (best) out.set(threadId, best);
+        if (best) out.set(threadId, got ? best : { ...best, stale: true });
         else if (Object.hasOwn(partialEventNotes, facts.get(threadId)?.providerId ?? "")) {
           const providerId = facts.get(threadId)!.providerId!;
           const fallback = await events.reportOf(threadId, providerId);

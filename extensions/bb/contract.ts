@@ -7,6 +7,10 @@ const amount = z.number().finite().nonnegative();
 const count = z.number().int().nonnegative();
 const threadId = z.string().regex(THREAD_ID);
 export const BUDGET_MAX = 1_000_000;
+export const budgetAmountSchema = z.number().finite().positive().max(BUDGET_MAX);
+export const budgetTargetSchema = z.strictObject({
+  threadId: threadId.optional().describe("A descendant thread ID. Omit to use your own thread."),
+});
 
 export const effectiveBudgetSchema = z.object({
   amount: z.number().finite().positive(),
@@ -77,7 +81,7 @@ export const rpcContract = defineRpcContract({
     input: z.object({
       threadId,
       // null: no budget for this thread even when the setting has one; "default": follow the setting again.
-      budget: z.union([z.number().finite().positive().max(BUDGET_MAX), z.null(), z.literal("default")]),
+      budget: z.union([budgetAmountSchema, z.null(), z.literal("default")]),
       includeChildren: z.boolean().optional(),
     }),
     output: z.object({ budget: effectiveBudgetSchema.nullable(), policy: policySchema }),

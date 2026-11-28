@@ -331,6 +331,7 @@ describe("Burn chip", () => {
       const slot = await renderChip(server);
       await vi.waitFor(async () => expect((await chipButton(slot)).dataset.running).toBe(""));
       expect(server.callsTo("usage")).toHaveLength(1);
+      await settle();
       running = false;
       await act(async () => {
         vi.advanceTimersByTime(WORKING_REFETCH_MS);

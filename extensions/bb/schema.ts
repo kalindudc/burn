@@ -125,6 +125,7 @@ const v2Schema = z.object({
   stoppedAt: amount.nullable(),
   // Burn 0.2 extensions send none.
   estimated: z.boolean().default(false),
+  possiblyUnpriced: z.boolean().optional(),
   agents: agentUsageSchema.optional(),
   coverageNote: z.string().max(500).optional(),
   coverage: z.enum(["available", "partial"]).optional(),

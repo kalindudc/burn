@@ -1,4 +1,4 @@
-import type { BbPluginApi, PluginSettingDescriptors } from "@get-bb/plugin-sdk";
+import type { BbPluginApi, PluginAgentToolResult, PluginSettingDescriptors } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { budgetState, EXPENSIVE_MIN_USD, EXPENSIVE_MULTIPLE, shouldStop } from "../../src/budget.js";
 import { applyDiscounts, DISCOUNT_MAX, DISCOUNT_MIN, NO_DISCOUNTS, sameDiscounts } from "../../src/discounts.js";
@@ -8,7 +8,7 @@ import { buildReport, type UsageReport } from "../../src/report.js";
 import type { UsageReply } from "../../src/wire.js";
 import { ALERT_CHANNEL } from "./alerts.js";
 import { effectiveBudget, type OwnBudget, policyFor, positiveOrNull } from "./budgets.js";
-import { BUDGET_MAX, type CostRow, type Family, rpcContract } from "./contract.js";
+import { BUDGET_MAX, budgetAmountSchema, budgetTargetSchema, type CostRow, type Family, rpcContract } from "./contract.js";
 import { createThreadDirectory, type ThreadRow } from "./directory.js";
 import { budgetKey, logKey, REPORT_PREFIX, reportKey, SETTINGS_COPY_KEY, stoppedKey } from "./keys.js";
 import { alertEvents, alertFor } from "./notify.js";
@@ -28,6 +28,10 @@ const MAX_THREADS = 500;
 const TITLE_TTL_MS = 60_000;
 const CHILD_DETAIL_LIMIT = 50;
 const UNTITLED = "Untitled thread";
+const TARGET_UNAVAILABLE = "Budget target unavailable.";
+const STALE_BUDGET = "The budget or its family changed. Read its current status and try again.";
+const toolError = (text: string): PluginAgentToolResult => ({ isError: true, content: [{ type: "text", text }] });
+const budgetScope = (budget: { includeChildren?: boolean } | null): "family" | "thread" => budget?.includeChildren ? "family" : "thread";
 /** A pi report this recent means the thread's Burn pi extension is reporting. */
 const PI_FRESH_MS = 2 * 60_000;
 /** How long an answer waits for hosts; a slower host's figures arrive as a usage signal. */
@@ -88,7 +92,7 @@ export const SETTINGS = {
     type: "boolean",
     label: "Stop a thread at its budget",
     description:
-      "Off by default: Burn never stops a thread unless you turn this on. When on, Burn stops the run whose cost crosses the thread's budget: in a pi thread with the Burn pi extension, the extension stops the run itself; otherwise Burn stops the thread's current work through bb. Claude Code threads are not stopped, because their cost arrives only as each turn ends. Send another prompt to continue; Burn does not stop a thread that is already over its budget again.",
+      "Off by default. When on, Burn stops the current work through bb when its discounted cost crosses a budget set in bb, including for pi threads. Claude Code threads are not stopped, because their cost arrives only as each turn ends. Send another prompt to continue; Burn does not stop a thread that is already over its budget again.",
     default: false,
   },
   flagOverBudget: {
@@ -205,6 +209,7 @@ interface Resolved {
   report: UsageReport;
   source: "pi" | "log" | "events";
   at: number;
+  recorded: boolean;
 }
 
 // A thread born after the plugin loaded has nothing earlier to be quiet about.
@@ -251,6 +256,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   // Assigned once the read handlers exist: a figure that changed must not be answered from a pass that started before it.
   let readsChanged: (threadIds?: readonly string[]) => void = () => undefined;
   let observing: Promise<void> = Promise.resolve();
+  let familyGeneration = 0;
+  type DelegationQuote = { ids: Set<string>; stale: boolean };
+  const delegationQuotes = new Set<DelegationQuote>();
   let missingTokenWarned = false;
   let disposed = false;
   let dailyTimer: ReturnType<typeof setTimeout> | undefined;
@@ -340,7 +348,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
           discounts,
         );
         const fromPi = stored !== null && Date.now() - stored.at < PI_FRESH_MS;
-        out.set(threadId, { report, source: fromPi ? "pi" : (log?.source ?? "log"), at: Math.max(log?.at ?? 0, stored?.at ?? 0) });
+        out.set(threadId, { report, source: fromPi ? "pi" : (log?.source ?? "log"), at: Math.max(log?.at ?? 0, stored?.at ?? 0), recorded: log !== undefined && !log.stale });
     });
     return out;
   }
@@ -384,6 +392,8 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     const cached = budgets.get(threadId);
     if (cached) return cached;
     const raw = await bb.storage.kv.get<unknown>(budgetKey(threadId));
+    const newer = budgets.get(threadId);
+    if (newer) return newer;
     let own: OwnBudget;
     let includeChildren = false;
     if (raw !== undefined) {
@@ -426,15 +436,20 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     return title;
   }
 
+  async function listedDescendants(threadIds: readonly string[], signal?: AbortSignal): Promise<Map<string, string[]>> {
+    // Archived and hidden children still cost money, and thread-spend counts them too.
+    const descendants = new Map<string, string[]>();
+    for (let start = 0; start < threadIds.length; start += 200) {
+      const { threads } = await bb.sdk.threads.experimental_listDescendants({ threadIds: threadIds.slice(start, start + 200), includeArchived: true, includeHidden: true, ...(signal ? { signal } : {}) });
+      for (const thread of threads) descendants.set(thread.threadId, thread.descendantIds);
+    }
+    return descendants;
+  }
+
   async function descendantsOf(threadIds: readonly string[], strict = false): Promise<Map<string, string[]>> {
     try {
-      // Archived and hidden children still cost money, and thread-spend counts them too.
-      const rows = await directory.all();
-      const descendants = new Map<string, string[]>();
-      for (let start = 0; start < threadIds.length; start += 200) {
-        const { threads } = await bb.sdk.threads.experimental_listDescendants({ threadIds: threadIds.slice(start, start + 200), includeArchived: true, includeHidden: true });
-        for (const thread of threads) descendants.set(thread.threadId, withOwnedThreads(thread.threadId, thread.descendantIds, rows));
-      }
+      const [rows, descendants] = await Promise.all([directory.all(), listedDescendants(threadIds)]);
+      for (const [id, children] of descendants) descendants.set(id, withOwnedThreads(id, children, rows));
       return descendants;
     } catch (err) {
       bb.log.warn(`listing the child threads of ${threadIds.length} thread(s) failed: ${message(err)}`);
@@ -521,23 +536,15 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     for (const event of events) bb.realtime.publish(ALERT_CHANNEL, alertFor(event, threadId, title, Date.now(), family));
   }
 
-  /**
-   * The server's stop, for a thread without the Burn pi extension: only with the
-   * stop setting on, while bb says the thread is working, for the change that
-   * crosses its budget. A thread whose extension has reported is left to it: the
-   * extension stops its own run from the policy in each reply, and bb's stop,
-   * which also releases the thread's runtime, must not race it.
-   */
   async function stopAtBudget(threadId: string, prev: UsageReport, next: UsageReport, values: Values, stopped: Set<string>): Promise<void> {
-    if (!values.stopAtBudget || !next.running || (await budgetOf(threadId, next, values))?.includeChildren) return;
+    if (!values.stopAtBudget || !next.running) return;
+    const cap = await budgetOf(threadId, next, values);
+    // A legacy Pi-only cap is display data, not a budget set in BB.
+    if (!cap || cap.source === "pi" || cap.includeChildren) return;
+    if (!shouldStop({ ...values, budget: cap.amount }, prev.cost.total, next.cost.total)) return;
     // A harness that reports a turn as it ends has nothing left to stop.
     if (!(await source.harnessOf(threadId))?.perCall) return;
-    const policy = policyFor((await ownBudget(threadId)).budget, values);
-    if (!shouldStop(policy, prev.cost.total, next.cost.total)) return;
-    // A stored report older than PI_FRESH_MS means no extension is reporting now, so bb's stop owns the thread again.
-    const reportedByPi = await load(threadId);
-    if (reportedByPi !== null && Date.now() - reportedByPi.at < PI_FRESH_MS) return;
-    await stopThread(threadId, policy.budget, stopped);
+    await stopThread(threadId, cap.amount, stopped);
   }
 
   async function stopThread(threadId: string, budget: number | null, stopped: Set<string>): Promise<void> {
@@ -655,8 +662,12 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
    * already over its budget stays quiet; a newer thread starts from nothing.
    */
   function observe(threadIds: readonly string[], pinned?: Pinned): Promise<void> {
-    const run = observing.then(() => (disposed ? undefined : look(threadIds, pinned)));
-    observing = run.catch(() => undefined);
+    return withBudgetOrder(async () => { if (!disposed) await look(threadIds, pinned); });
+  }
+
+  function withBudgetOrder<T>(work: () => Promise<T>): Promise<T> {
+    const run = observing.then(work);
+    observing = run.then(() => undefined, () => undefined);
     return run;
   }
 
@@ -670,6 +681,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
 
   /** The source's news: a host saw these threads' logs change, or bb says they started or stopped working. */
   function changed(threadIds: string[], pinned?: Pinned): void {
+    for (const quote of delegationQuotes) if (threadIds.some(id => quote.ids.has(id))) quote.stale = true;
     observe(threadIds, pinned)
       .catch((err: unknown) => {
         if (!disposed) bb.log.warn(`looking at the new figures of ${threadIds.length} thread(s) failed: ${message(err)}`);
@@ -769,24 +781,37 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     spendRead.invalidate();
   };
 
+  // Both writers install the baseline with the cap, without reading reports in the queue.
+  async function writeBudget(threadId: string, budget: number | null | "default", baseline: UsageReport | null) {
+    const shared = baseline !== null;
+    if (budget === "default") await bb.storage.kv.delete(budgetKey(threadId));
+    else await bb.storage.kv.set(budgetKey(threadId), { budget, ...(shared ? { includeChildren: true } : {}) });
+    if (baseline) remember(observedFamilies, threadId, baseline);
+    else observedFamilies.delete(threadId);
+    remember(budgets, threadId, { budget: budget === "default" ? undefined : budget, includeChildren: shared });
+    readsChanged([threadId]);
+    bb.realtime.publish("usage", { threadId });
+  }
+
   bb.rpc.register(rpcContract, {
     // A burst of usage signals for one thread (or its children) must not start a family read per signal.
     usage: usageRead,
     setBudget: async ({ threadId, budget, includeChildren }) => {
-      await observing;
-      const own = await ownBudget(threadId);
-      const shared = typeof budget === "number" && (includeChildren ?? own.includeChildren);
+      const shared = typeof budget === "number" && (includeChildren ?? (await ownBudget(threadId)).includeChildren);
+      let baseline: UsageReport | null = null;
       if (shared) {
-        const descendants = (await descendantsOf([threadId], true)).get(threadId) ?? [];
-        remember(observedFamilies, threadId, budgetReport(await resolveMany([threadId, ...descendants], undefined, "list", true), [threadId, ...descendants]));
-      } else observedFamilies.delete(threadId);
-      if (budget === "default") await bb.storage.kv.delete(budgetKey(threadId));
-      else await bb.storage.kv.set(budgetKey(threadId), { budget, ...(shared ? { includeChildren: true } : {}) });
-      remember(budgets, threadId, { budget: budget === "default" ? undefined : budget, includeChildren: shared });
-      readsChanged([threadId]);
-      bb.realtime.publish("usage", { threadId });
-      const report = (await resolve(threadId))?.report ?? null;
-      return { budget: await budgetOf(threadId, report), policy: await policyOf(threadId) };
+        const children = (await descendantsOf([threadId], true)).get(threadId) ?? [];
+        const ids = [threadId, ...children];
+        baseline = budgetReport(await resolveMany(ids, undefined, "list", true), ids);
+      }
+      return withBudgetOrder(async () => {
+        if (typeof budget === "number" && includeChildren === undefined && shared !== (await ownBudget(threadId)).includeChildren) {
+          throw new Error(STALE_BUDGET);
+        }
+        await writeBudget(threadId, budget, baseline);
+        const report = (await load(threadId))?.report ?? null;
+        return { budget: await budgetOf(threadId, report), policy: await policyOf(threadId) };
+      });
     },
     costs: costsRead,
     overBudget: overBudgetRead,
@@ -794,7 +819,180 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     spend: spendRead,
   });
 
-  // The Burn pi extension reports each change here (extensions/pi/bb-report.ts) and applies the policy in the reply.
+  async function liveThread(threadId: string, signal: AbortSignal) {
+    signal.throwIfAborted();
+    const thread = await bb.sdk.threads.get({ threadId, signal });
+    if (thread.id !== threadId || thread.deletedAt !== null) throw new Error(TARGET_UNAVAILABLE);
+    return thread;
+  }
+
+  async function liveFamilies(ids: readonly string[], signal: AbortSignal, previous?: Map<string, string[]>) {
+    if (!ids.length) return new Map<string, string[]>();
+    const listed = await listedDescendants(ids, signal);
+    if (ids.some(id => !listed.has(id))) throw new Error(TARGET_UNAVAILABLE);
+    if (!previous) {
+      const rows = await directory.allLive(signal);
+      for (const [id, children] of listed) listed.set(id, withOwnedThreads(id, children, rows));
+      return listed;
+    }
+    // The SDK gives current parentage. Refresh only the candidates reached by lifecycle ownership.
+    const candidates = new Set<string>();
+    for (const [id, children] of listed) {
+      const ordinary = new Set(children);
+      for (const child of previous.get(id)!) if (!ordinary.has(child)) candidates.add(child);
+    }
+    const rows: Awaited<ReturnType<typeof liveThread>>[] = [];
+    await eachLimit([...candidates], 32, async id => { rows.push(await liveThread(id, signal)); });
+    for (const [id, children] of listed) listed.set(id, withOwnedThreads(id, children, rows));
+    return listed;
+  }
+
+  async function authorizeTarget(caller: string, target: string, family: Map<string, string[]>, signal: AbortSignal) {
+    if (caller !== target && !family.get(caller)?.includes(target)) throw new Error(TARGET_UNAVAILABLE);
+    await Promise.all((caller === target ? [caller] : [caller, target]).map(id => liveThread(id, signal)));
+  }
+
+  function knownSpend(value: Resolved | undefined) {
+    return {
+      knownUsd: value?.report.cost.total ?? null,
+      coverage: value === undefined ? "missing" : !value.recorded || value.report.coverage === "partial" ? "partial" : "available",
+      estimated: value?.report.estimated ?? false,
+      possiblyUnpriced: value?.report.possiblyUnpriced ?? null,
+    };
+  }
+
+  bb.agents.registerTool({
+    name: "burn_budget_status",
+    description: "Read Burn's lifetime budget and known USD spend for your thread or a descendant. Lists up to 50 child threads. Spend is best effort, not a billing guarantee.",
+    parameters: budgetTargetSchema,
+    async execute({ threadId: target }, { threadId: caller, signal }) {
+      const threadId = target ?? caller;
+      try {
+        const roots = [...new Set([caller, threadId])];
+        const family = await liveFamilies(roots, signal);
+        await authorizeTarget(caller, threadId, family, signal);
+        const children = family.get(threadId)!;
+        const ids = [threadId, ...children];
+        const resolved = await resolveMany(ids);
+        const report = resolved.get(threadId)?.report ?? null;
+        const [budget, policy] = await Promise.all([budgetOf(threadId, report), policyOf(threadId)]);
+        const latest = await liveFamilies(roots, signal, family);
+        await authorizeTarget(caller, threadId, latest, signal);
+        const current = new Set(latest.get(threadId)!);
+        if (children.some(id => !current.has(id))) return toolError(TARGET_UNAVAILABLE);
+        signal.throwIfAborted();
+        const own = knownSpend(resolved.get(threadId));
+        const all = ids.map(id => knownSpend(resolved.get(id)));
+        const familyCost = resolved.size ? budgetReport(resolved, ids).cost.total : null;
+        const cost = budget?.includeChildren ? familyCost : own.knownUsd;
+        return JSON.stringify({
+          threadId, own,
+          family: {
+            knownUsd: familyCost,
+            coverage: !resolved.size ? "missing" : all.every(row => row.coverage === "available") ? "available" : "partial",
+            estimated: all.some(row => row.estimated),
+            possiblyUnpriced: all.some(row => row.possiblyUnpriced === true) ? true : all.every(row => row.possiblyUnpriced === false) ? false : null,
+            childCount: children.length,
+            reportedChildCount: children.filter(id => resolved.has(id)).length,
+            children: children.map(id => ({ threadId: id, ...knownSpend(resolved.get(id)) }))
+              .sort((a, b) => (b.knownUsd ?? -1) - (a.knownUsd ?? -1)).slice(0, CHILD_DETAIL_LIMIT),
+          },
+          budget: budget && { amount: budget.amount, source: budget.source, scope: budgetScope(budget),
+            remainingUsd: cost === null ? null : Math.max(0, budget.amount - cost),
+            state: cost === null ? "unknown" : budgetState(cost, budget.amount) },
+          stopAtBudget: policy.stopAtBudget,
+        });
+      } catch {
+        return toolError(TARGET_UNAVAILABLE);
+      }
+    },
+  });
+
+  async function capSnapshot(threadId: string) {
+    const [own, stored, values] = await Promise.all([ownBudget(threadId), load(threadId), settings.get()]);
+    return { own, applied: effectiveBudget(own.budget, values.threadBudget, stored?.report.budget ?? null, own.includeChildren), discounts: discountsOf(values) };
+  }
+
+  function fitsFamily(resolved: Map<string, Resolved>, ids: string[], targetIds: string[], parentAmount: number, newAmount: number, discounts: ReturnType<typeof discountsOf>): boolean {
+    if (source.reading(ids) > 0 || ids.some(id => {
+      const value = resolved.get(id);
+      return !value?.recorded || value.report.coverage === "partial" || value.report.estimated || value.report.possiblyUnpriced !== false;
+    })) return false;
+    const priced = new Map(ids.map(id => {
+      const value = resolved.get(id)!;
+      return [id, { ...value, report: applyDiscounts(value.report, discounts) }];
+    }));
+    if (targetIds.some(id => !priced.has(id))) return false;
+    const headroom = Math.max(0, newAmount - budgetReport(priced, targetIds).cost.total);
+    return headroom <= parentAmount - budgetReport(priced, ids).cost.total;
+  }
+
+  bb.agents.registerTool({
+    name: "burn_set_budget",
+    description: "Set the absolute lifetime USD cap for your thread or a descendant, keeping its scope. For increases, ask the human to use the Burn budget editor unless this is a descendant whose new headroom fits your own shared family budget.",
+    parameters: budgetTargetSchema.extend({ amountUsd: budgetAmountSchema.describe("New lifetime cap in USD, not a delta.") }),
+    async execute({ threadId: target, amountUsd }, { threadId: caller, signal }) {
+      const threadId = target ?? caller;
+      let quote: DelegationQuote | undefined;
+      try {
+        const generation = familyGeneration;
+        const overrides = priceOverrides;
+        const before = await capSnapshot(threadId);
+        const shared = before.own.includeChildren;
+        const oldAmountUsd = before.applied?.amount;
+        const increase = oldAmountUsd !== undefined && amountUsd > oldAmountUsd;
+        const parent = increase && caller !== threadId ? await ownBudget(caller) : null;
+        const parentAmount = parent?.includeChildren && typeof parent.budget === "number" ? parent.budget : null;
+        const willReadShared = shared && (!increase || parentAmount !== null);
+        const roots = [...new Set([...(caller !== threadId ? [caller] : []), ...(willReadShared ? [threadId] : [])])];
+        const family = await liveFamilies(roots, signal);
+        await authorizeTarget(caller, threadId, family, signal);
+
+        const refuseIncrease = () => toolError(`Cannot raise ${threadId} from USD ${oldAmountUsd} to USD ${amountUsd} with this tool. Ask the human to change the amount in Burn's budget editor.`);
+        if (increase && parentAmount === null) return refuseIncrease();
+
+        const parentIds = parentAmount === null ? [] : [caller, ...family.get(caller)!];
+        if (parentAmount !== null) {
+          quote = { ids: new Set(parentIds), stale: false };
+          delegationQuotes.add(quote);
+        }
+        const targetIds = [threadId, ...(family.get(threadId) ?? [])];
+        const readIds = parentAmount !== null ? parentIds : shared ? targetIds : [];
+        const resolved = readIds.length ? await resolveMany(readIds, undefined, "list", shared) : new Map<string, Resolved>();
+        const baseline = shared ? budgetReport(resolved, targetIds) : null;
+        const fits = parentAmount !== null && fitsFamily(resolved, parentIds, targetIds, parentAmount, amountUsd, before.discounts);
+
+        return await withBudgetOrder(async () => {
+          const latest = await liveFamilies(roots, signal, family);
+          await authorizeTarget(caller, threadId, latest, signal);
+          const [current, currentParent] = await Promise.all([capSnapshot(threadId), parent ? ownBudget(caller) : null]);
+          const sameFamily = (id: string) => {
+            const currentIds = new Set(latest.get(id)!);
+            const previousIds = family.get(id)!;
+            return currentIds.size === previousIds.length && previousIds.every(child => currentIds.has(child));
+          };
+          if (
+            current.applied?.amount !== oldAmountUsd || current.own.includeChildren !== shared ||
+            (shared && !sameFamily(threadId)) ||
+            (roots.length > 0 && generation !== familyGeneration) ||
+            (parent && (currentParent?.budget !== parent.budget || currentParent?.includeChildren !== parent.includeChildren ||
+              !sameFamily(caller) || overrides !== priceOverrides || !sameDiscounts(current.discounts, before.discounts) || quote?.stale))
+          ) return toolError(STALE_BUDGET);
+          signal.throwIfAborted();
+          if (increase && (!fits || source.reading(parentIds) > 0)) return refuseIncrease();
+
+          await writeBudget(threadId, amountUsd, baseline);
+          return JSON.stringify({ threadId, budget: { amount: amountUsd, source: "thread", scope: budgetScope(before.applied) } });
+        });
+      } catch {
+        return toolError(TARGET_UNAVAILABLE);
+      } finally {
+        if (quote) delegationQuotes.delete(quote);
+      }
+    },
+  });
+
+  // Keep accepting reports and session-file hints from older Burn pi extensions.
   bb.http.route("POST", "/usage", async (c) => {
     // Reject traffic that carries no token before parsing up to 240 KB of body.
     const token = c.req.header("x-burn-token") ?? "";
@@ -822,7 +1020,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     if (!sameToken(token, usageToken(usageSecret, threadId))) {
       return c.json({ ok: false, error: "invalid usage token" } satisfies UsageReply, 401);
     }
-    const policy = await policyOf(threadId);
+    const policy = { ...(await policyOf(threadId)), stopAtBudget: false, notifyExpensiveTurn: false };
     const held = await load(threadId);
     if (held && sentAt < held.sentAt) return c.json({ ok: true, policy } satisfies UsageReply);
     const stored: Stored = { report, sentAt, at: Date.now(), ...(sessionFile ? { sessionFile } : {}) };
@@ -846,7 +1044,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     {
       name: "BURN_BB_URL",
       value: { serverPath: `/api/v1/plugins/${bb.pluginId}/http/usage` },
-      reason: "Where the Burn pi extension reports this thread's cost to the Burn plugin",
+      reason: "Where legacy Burn pi extensions can still report thread usage",
     },
     {
       name: "BURN_BB_TOKEN",
@@ -856,23 +1054,30 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   ] : []);
 
   // A thread moving in or out of the archive moves in or out of the sidebar's flags.
-  for (const name of ["thread.created", "thread.archived", "thread.unarchived"] as const) {
+  for (const name of ["thread.created", "thread.archived", "thread.unarchived", "experimental_thread.parentChanged"] as const) {
     bb.events.on(name, () => {
+      familyGeneration++;
       directory.refresh();
       readsChanged();
     });
   }
 
   bb.events.on("thread.deleted", async ({ thread }) => {
+    familyGeneration++;
     directory.refresh();
     reports.delete(thread.id);
-    budgets.delete(thread.id);
     titles.delete(thread.id);
     observed.delete(thread.id);
-    observedFamilies.delete(thread.id);
     stops.delete(thread.id);
     try {
-      await Promise.all([source.forget(thread.id), ...[reportKey, budgetKey, logKey, stoppedKey].map((key) => bb.storage.kv.delete(key(thread.id)))]);
+      await Promise.all([
+        withBudgetOrder(async () => {
+          budgets.delete(thread.id);
+          observedFamilies.delete(thread.id);
+          await bb.storage.kv.delete(budgetKey(thread.id));
+        }),
+        source.forget(thread.id), ...[reportKey, logKey, stoppedKey].map((key) => bb.storage.kv.delete(key(thread.id))),
+      ]);
     } catch (err) {
       bb.log.warn(`forgetting the usage report of ${thread.id} failed: ${message(err)}`);
     }

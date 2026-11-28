@@ -9,9 +9,12 @@ import {
 import { type CSSProperties, type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { budgetState } from "../../../src/budget.js";
 import { formatAmount, formatBudget, formatTokenCount, formatUsd, modelName } from "../../../src/format.js";
+import { HOUR_MS } from "../../../src/report.js";
 import { CalendarIcon, ChevronDownIcon, ChevronLeftIcon, ChevronRightIcon } from "../icon.js";
 import { cn } from "../lib/utils.js";
 import { readPrefs } from "../prefs.js";
+import { spendTimeLabel } from "../spend-axis.js";
+import { CumulativeSpendChart } from "../spend-chart.js";
 import type { SpendMetric, SpendOutput, SpendPanel, SpendRange, SpendZone, spendMethods } from "./contract.js";
 import { dayDate, RANGE_DAYS } from "./days.js";
 import { FIRST_DAY, isDay, isLatest, type Period, parsePeriod, periodEnding, periodLabel, periodPath, stepPeriod } from "./period.js";
@@ -456,7 +459,7 @@ function DayChart({ data, onOpenDay }: { data: SpendOutput; onOpenDay: (day: str
   );
 }
 
-/** One day has no shape over time, so today reads as its split by model against the Daily budget. */
+/** The Day's split by model, with the existing Daily budget comparison. */
 function TodayBar({ data }: { data: SpendOutput }) {
   const { models, metric } = data;
   const dailyBudget = metric === "cost" ? data.dailyBudget : null;
@@ -487,6 +490,58 @@ function TodayBar({ data }: { data: SpendOutput }) {
         ) : null}
       </div>
     </div>
+  );
+}
+
+function DaySpend({ data }: { data: SpendOutput }) {
+  const { hourlyCost, estimated } = data;
+  const hasHours = hourlyCost !== undefined && hourlyCost.hours.length > 0;
+  const timeZone = hourlyCost?.timeZone ?? "UTC";
+  const notes: string[] = [];
+  let chart = <p className="text-xs text-muted-foreground">No hourly dollar data for this day.</p>;
+  if (hasHours) {
+    const { start, end, budget, hours, omittedBoundaryCost } = hourlyCost;
+    const points = [{ at: start, total: 0 }];
+    let through = start;
+    let total = 0;
+    for (const { at, cost } of hours) {
+      if (at > through) points.push({ at, total });
+      total += cost;
+      through = Math.min(at + HOUR_MS, end);
+      points.push({ at: through, total });
+    }
+    const shown = formatAmount(total, estimated);
+    const dayTotal = formatAmount(data.total, estimated);
+    if (shown !== dayTotal) notes.push(`Hours shown add up to ${shown}; the day total is ${dayTotal}.`);
+    if (hourlyCost.timeZone === null) notes.push("Times are in UTC because the server's local time zone is not named.");
+    // Independently summed totals can differ in floating-point precision, but must agree on reaching the cap.
+    const reconciled = Math.abs(total - data.total) <= Math.max(total, data.total) * 1e-9;
+    const budgetUsd = budget !== null && budget > 0 && budget / 2 <= total && reconciled &&
+      (total >= budget) === (data.total >= budget) && !omittedBoundaryCost && data.reading === 0 ? budget : undefined;
+    const span = `From ${spendTimeLabel(start, timeZone)} to ${spendTimeLabel(end, timeZone)} in ${timeZone}.`;
+    chart = (
+      <CumulativeSpendChart
+        points={points}
+        from={start}
+        to={end}
+        estimated={estimated}
+        ariaLabel={`Cumulative spend from hourly data: ${shown}. ${span}${budgetUsd === undefined ? "" : ` Daily budget ${formatBudget(budgetUsd)}.`}`}
+        timeZone={timeZone}
+        {...(budgetUsd === undefined ? {} : { budgetUsd })}
+      />
+    );
+  }
+  if (hourlyCost?.omittedBoundaryCost) notes.push("Hours that cross midnight are omitted.");
+  if (data.reading > 0) notes.push("Some reports are still loading.");
+  return (
+    <section aria-label="Spend over time" className="mt-4">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+        <h3 className="text-[11px] font-semibold tracking-wide text-muted-foreground uppercase">Spend over time</h3>
+        {hasHours ? <span className="text-xs text-muted-foreground">Hourly totals · {timeZone}</span> : null}
+      </div>
+      {chart}
+      {notes.length > 0 ? <p className="mt-1 text-xs text-muted-foreground">{notes.join(" ")}</p> : null}
+    </section>
   );
 }
 
@@ -667,6 +722,7 @@ function Dashboard({
             {zoneSuffix(data.tz)}
           </PanelLabel>
           {data.range === "today" ? <TodayBar data={data} /> : <DayChart data={data} onOpenDay={onOpenDay} />}
+          {data.range === "today" && metric === "cost" ? <DaySpend data={data} /> : null}
         </section>
       ))}
       <Pair left={shown("mix", () => <TokenMix data={data} hide={hide("mix")} />, CARD)} right={shown("time", () => <CallTime data={data} hide={hide("time")} />, CARD)} />

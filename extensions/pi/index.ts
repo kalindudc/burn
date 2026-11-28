@@ -60,6 +60,9 @@ function contextOf(ctx: ExtensionContext): UsageReport["context"] {
 
 export function createBurn(deps: BurnDeps = {}): (pi: ExtensionAPI) => void {
   return (pi) => {
+    // bb owns usage and budget enforcement for its threads.
+    if (process.env.BB_THREAD_ID) return;
+
     const reporter = deps.reporter ?? createBbReporter({});
     const now = deps.now ?? Date.now;
     const copy = deps.copy ?? copyToClipboard;

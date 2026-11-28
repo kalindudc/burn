@@ -120,6 +120,8 @@ export interface UsageReport {
   stoppedAt: number | null;
   /** Some of the cost is a list-price estimate rather than recorded by the harness. */
   estimated: boolean;
+  /** Some token usage has no positive cost; a free call and a missing price may look the same. */
+  possiblyUnpriced?: boolean;
 }
 
 /** Structural on purpose: pi's SessionEntry interfaces are assignable, and tests use plain objects. */
@@ -552,6 +554,7 @@ export function buildReport(
   let calls = 0;
   let lastTurnCost = 0;
   let estimated = false;
+  let possiblyUnpriced = false;
   let started = false;
   let startedAt = 0;
   let updatedAt = 0;
@@ -594,6 +597,7 @@ export function buildReport(
     cost.total += usage.cost.total;
     lastTurnCost += usage.cost.total;
     if (usage.estimated === true && usage.cost.total > 0) estimated = true;
+    if (usage.cost.total === 0 && tokensOf(usage) > 0) possiblyUnpriced = true;
 
     const row = models.get(key) ?? newModelRow(key);
     row.cost += usage.cost.total;
@@ -660,5 +664,6 @@ export function buildReport(
     budget: null,
     stoppedAt: null,
     estimated,
+    possiblyUnpriced,
   };
 }

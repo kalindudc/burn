@@ -7,8 +7,8 @@ import { harnessName } from "../harnesses.js";
 import { REPORT_PREFIX, SPEND_PANELS_KEY } from "../keys.js";
 import { type Stored, storedSchema } from "../schema.js";
 import { SPEND_PANELS, type SpendMetric, type SpendOutput, type SpendPanel, type SpendPanels, type SpendRange, type SpendZone } from "./contract.js";
-import { dayDate, localDays, RANGE_DAYS } from "./days.js";
-import { activityGrid, addUsage, callTimeQuantile, emptyUsage, type Usage } from "./tally.js";
+import { dayBounds, dayDate, localDays, RANGE_DAYS } from "./days.js";
+import { activityGrid, addUsage, callTimeQuantile, emptyUsage, hourlyCosts, type Usage } from "./tally.js";
 
 export interface SpendDeps {
   bb: BbPluginApi;
@@ -356,8 +356,10 @@ export function createSpendHandlers(deps: SpendDeps): {
 
   return {
     async spend({ range, projectId, tz = "local", metric = "cost", listPrice = false, end = null }) {
-      const today = localDays(now(), 1, 0, tz)[0] as string;
-      const at = dayDate(end !== null && end < today ? end : today, tz).getTime();
+      const requestedAt = now();
+      const today = dayKey(requestedAt, tz === "utc" ? "UTC" : undefined);
+      const selectedDay = end !== null && end < today ? end : today;
+      const at = dayDate(selectedDay, tz).getTime();
       const length = RANGE_DAYS[range];
       const dayList = localDays(at, length, 0, tz);
       const inRange: ReadonlySet<string> = new Set(dayList);
@@ -456,6 +458,18 @@ export function createSpendHandlers(deps: SpendDeps): {
       const pricedCalls = priced.reduce((sum, row) => sum + row.used.calls, 0);
       const mixTokens = sums.mix.tokens;
       const prompt = mixTokens.input + mixTokens.cacheRead + mixTokens.cacheWrite;
+      const hours = counted.flatMap((row) => row.report.hours);
+      let hourlyCost: SpendOutput["hourlyCost"];
+      if (range === "today" && metric === "cost") {
+        const { start, end } = dayBounds(selectedDay, tz);
+        hourlyCost = {
+          start,
+          end: Math.min(end, requestedAt),
+          timeZone: tz === "utc" ? "UTC" : (new Intl.DateTimeFormat().resolvedOptions().timeZone ?? null),
+          budget: tz === "local" && selectedDay === today && projectId === null && !listPrice ? dailyBudget : null,
+          ...hourlyCosts(hours, start, end, requestedAt),
+        };
+      }
 
       return {
         range,
@@ -484,12 +498,8 @@ export function createSpendHandlers(deps: SpendDeps): {
           p50: callTimeQuantile(sums.callTime, 0.5),
           p90: callTimeQuantile(sums.callTime, 0.9),
         },
-        activity: activityGrid(
-          counted.flatMap((row) => row.report.hours),
-          dayList,
-          tz,
-          metric,
-        ),
+        activity: activityGrid(hours, dayList, tz, metric),
+        ...(hourlyCost === undefined ? {} : { hourlyCost }),
         threads: top,
         projects: projectRows,
         models,

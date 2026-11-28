@@ -21,15 +21,18 @@ type Command = {
 let agentDir: string;
 beforeEach(() => {
   agentDir = mkdtempSync(join(tmpdir(), "burn-agent-"));
+  vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+  vi.stubEnv("BB_THREAD_ID", undefined);
 });
 afterEach(() => {
+  vi.unstubAllEnvs();
   rmSync(agentDir, { recursive: true, force: true });
   vi.useRealTimers();
 });
 
 const writeSettings = (value: unknown) => writeFileSync(join(agentDir, "burn.json"), typeof value === "string" ? value : JSON.stringify(value));
 
-function setup(opts: { entries?: unknown[]; header?: unknown; mode?: string; hasUI?: boolean; bbPolicy?: BudgetPolicy | null } = {}) {
+function setup(opts: { entries?: unknown[]; header?: unknown; mode?: string; hasUI?: boolean; bbPolicy?: BudgetPolicy | null } = {}, extension?: typeof burn) {
   const handlers = new Map<string, Handler>();
   const commands = new Map<string, Command>();
   const entries: unknown[] = opts.entries ?? [user(), assistant(1.5)];
@@ -77,7 +80,8 @@ function setup(opts: { entries?: unknown[]; header?: unknown; mode?: string; has
     abort,
     switchSession,
   };
-  createBurn({ agentDir: () => agentDir, reporter, copy, listSessions: async () => [], now: () => 1_000 })(pi as never);
+  const initialize = extension ?? createBurn({ agentDir: () => agentDir, reporter, copy, listSessions: async () => [], now: () => 1_000 });
+  initialize(pi as never);
   const fire = (name: string, event: unknown = {}) => handlers.get(name)?.(event, ctx);
   const run = (args: string) => commands.get("burn")!.handler(args, ctx);
   const spend = (cost: number) => entries.push(assistant(cost));
@@ -108,8 +112,23 @@ function setup(opts: { entries?: unknown[]; header?: unknown; mode?: string; has
 const notes = (notify: ReturnType<typeof vi.fn>) => notify.mock.calls.map((c) => String(c[0]));
 
 describe("burn pi extension", () => {
-  it("exports a ready extension factory", () => {
-    expect(typeof burn).toBe("function");
+  it.each([
+    ["without a Burn plugin endpoint", undefined, undefined],
+    ["with a Burn plugin endpoint", "http://127.0.0.1:4318/usage", "test-token"],
+  ])("registers nothing in BB-managed Pi %s", (_label, url, token) => {
+    writeSettings({ defaultBudget: 1, stopAtBudget: true, notifyExpensiveTurn: true });
+    vi.stubEnv("BB_THREAD_ID", "thr_test0001");
+    vi.stubEnv("BURN_BB_URL", url);
+    vi.stubEnv("BURN_BB_TOKEN", token);
+    const t = setup({ mode: "rpc" }, burn);
+    expect([t.handlers.size, t.commands.size]).toEqual([0, 0]);
+  });
+
+  it("registers /burn and shows dollar spend in standalone Pi", () => {
+    const t = setup({}, burn);
+    expect(t.commands.has("burn")).toBe(true);
+    t.fire("session_start");
+    expect(t.setStatus).toHaveBeenLastCalledWith("burn", expect.stringContaining("$1.50"));
   });
 
   it("counts a forked session only from its creation, not the parent's copied calls", () => {
@@ -164,7 +183,7 @@ describe("burn pi extension", () => {
     for (const name of ["session_start", "agent_start", "turn_end", "agent_end"]) expect(() => t.fire(name), name).not.toThrow();
   });
 
-  it("reports to bb with the fields pi sets", () => {
+  it("sends running state and budget fields to the injected reporter", () => {
     const t = setup({ mode: "rpc" });
     t.fire("session_start");
     t.fire("agent_start");
@@ -347,7 +366,7 @@ describe("budgets", () => {
     expect(t.lastPill()).toContain(" / $10");
   });
 
-  it("takes bb's budget in a bb thread, falling back to pi's own when bb has none", async () => {
+  it("uses the injected policy's budget, falling back to pi's own when it has none", async () => {
     const t = setup({ mode: "rpc", bbPolicy: { budget: 20, stopAtBudget: false, notifyExpensiveTurn: false } });
     await t.run("budget 4");
     await t.run("budget");
@@ -377,17 +396,17 @@ describe("budgets", () => {
     ]);
   });
 
-  it("does not alert when a session that is already over budget opens, nor in a bb thread", async () => {
+  it("does not alert when a session that is already over budget opens, nor in RPC mode", () => {
     writeSettings({ defaultBudget: 10 });
     const t = setup({ entries: [user(), assistant(12)] });
     t.fire("session_start");
     t.fire("turn_end");
     expect(t.notify).not.toHaveBeenCalled();
-    const bb = setup({ mode: "rpc", entries: [user(), assistant(7)] });
-    bb.fire("session_start");
-    bb.spend(4);
-    bb.fire("turn_end");
-    expect(bb.notify).not.toHaveBeenCalled();
+    const rpc = setup({ mode: "rpc", entries: [user(), assistant(7)] });
+    rpc.fire("session_start");
+    rpc.spend(4);
+    rpc.fire("turn_end");
+    expect(rpc.notify).not.toHaveBeenCalled();
   });
 
   it("reports a malformed burn.json once and uses the defaults", () => {
@@ -452,7 +471,7 @@ describe("stopping at the budget", () => {
     expect(t.sent.at(-1)?.stoppedAt).toBeNull();
   });
 
-  it("follows bb's policy in a bb thread, stopping without a notification", () => {
+  it("honors an injected stop policy in RPC mode without a notification", () => {
     const off = crossing({ settings: { stopAtBudget: true }, mode: "rpc", bbPolicy: { budget: null, stopAtBudget: false, notifyExpensiveTurn: false } });
     expect(off.abort).not.toHaveBeenCalled();
     const on = crossing({ mode: "rpc", bbPolicy: { budget: 10, stopAtBudget: true, notifyExpensiveTurn: false } });

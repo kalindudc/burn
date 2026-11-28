@@ -1,6 +1,6 @@
 # How Burn works
 
-Burn has two halves: a bb plugin and a pi extension. The bb plugin alone is enough in bb. The pi extension adds the pill and `/burn` in pi's terminal, with or without bb, and makes the budget stop faster in a bb thread.
+Burn has two halves: a bb plugin for bb-managed threads, and a pi extension for standalone pi. The pi extension adds the pill and `/burn` in the terminal and stays inactive in bb.
 
 ## Where the numbers come from
 
@@ -38,14 +38,8 @@ bb deletes older usage events and keeps only the latest one for each thread. So 
 
 ## The pi extension in a bb thread
 
-The pi extension's report is optional. bb ignores a pi extension's footer status, so in a bb thread the pi extension sends its numbers to the plugin instead.
+The pi extension recognises BB-managed sessions and does not register commands or handlers there. The bb plugin reads the session log and enforces budgets set in bb using discounted cost, the same amount the panel displays. For a budget that includes children, the plugin uses the combined cost and stops the running family when it crosses the limit and stopping is on.
 
-The plugin gives pi an address through the `BURN_BB_URL` environment variable. pi posts a small JSON report when a run starts, after each model call, and when the run ends. Only bb's own pi reports, which runs in RPC mode; a `pi -p` started from a thread's shell does not.
-
-The figures still come from the session log. The report adds only what the log cannot know: the budget set with `/burn budget`, when pi stopped a run, and the context window. It also names the session log's path, so the plugin can read the log wherever bb keeps pi's sessions. The machine also reads that folder for the thread's own sessions, and only files there that are named for one of them and are regular files, not links. It does not watch the file's folder: each report from that thread's pi has the plugin read the log again.
-
-The plugin's reply carries the thread's budget policy, so pi in a bb thread follows bb's budget settings. A thread budget set in bb takes precedence over one set with `/burn budget`. For a thread-only budget with the pi extension installed, pi stops a run at its budget from inside pi, which is faster than stopping it through bb. An opt-in budget that includes children is enforced by bb instead: the plugin combines the reports for the whole family and stops its running threads when that total crosses the budget. The policy tells pi to leave shared-budget enforcement to bb, because pi cannot see sibling spending.
-
-bb gives pi the address to report to only when it starts a pi session. So after you install the pi extension, a thread that was already running starts reporting only after it restarts. Its cost shows in bb either way, from the session log.
+For older pi extensions, the bb plugin still accepts authenticated usage reports and session-log hints, but replies with a policy that disables stops in pi. If an already-running pi thread loaded the old extension, restart it after updating so it cannot use a cached stop policy.
 
 See [Usage coverage and workflow accounting](usage-coverage.md) for source limits and the distinction between native subagents and BB workflow workers.

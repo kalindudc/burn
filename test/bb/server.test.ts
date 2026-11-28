@@ -25,6 +25,7 @@ type Options = {
   descendants?: Record<string, string[]>;
   parents?: Record<string, string>;
   owners?: Record<string, string>;
+  deleted?: Set<string>;
   titles?: Record<string, string>;
   /** Session log entries per thread, as the Burn host entry on the thread's machine reads them. */
   logs?: Record<string, unknown[]>;
@@ -84,7 +85,7 @@ async function setup(opts: Options = {}) {
               parentThreadId: opts.parents?.[id],
               lifecycleOwnerThreadId: opts.owners?.[id],
               updatedAt: Date.now(),
-              deletedAt: null,
+              deletedAt: opts.deleted?.has(id) ? Date.now() : null,
               status: statuses[id] ?? "idle",
             }))
           ).map(row);
@@ -102,6 +103,9 @@ async function setup(opts: Options = {}) {
             title: opts.titles?.[threadId] ?? null,
             providerId: opts.providers?.[threadId] ?? "pi",
             environmentId: "env_1",
+            parentThreadId: opts.parents?.[threadId] ?? null,
+            lifecycleOwnerThreadId: opts.owners?.[threadId] ?? null,
+            deletedAt: opts.deleted?.has(threadId) ? Date.now() : null,
             status: statuses[threadId] ?? "idle",
           }),
         stop: async () => ({ ok: true as const }),
@@ -173,6 +177,230 @@ async function setup(opts: Options = {}) {
   return { bb, harness, post, rpc, usage, signals, alerts, logs, mtimes, statuses, spend, stops, record, rows, hostAsked: () => [...hostAsked], hostThreads: () => [...hostThreads], hold };
 }
 
+describe("agent budget tools", () => {
+  type Fixture = Awaited<ReturnType<typeof setup>>;
+  const call = (s: Fixture, name: "status" | "set", args: unknown, threadId = THREAD, signal?: AbortSignal) =>
+    s.harness.behavior.callAgentTool(name === "status" ? "burn_budget_status" : "burn_set_budget", args, { threadId, ...(signal ? { signal } : {}) });
+  const cap = (s: Fixture, id = THREAD) => s.bb.storage.kv.get(`budget:${id}`);
+  const answer = (value: Awaited<ReturnType<typeof call>>) => {
+    expect(typeof value).toBe("string");
+    return JSON.parse(value as string);
+  };
+  const estimate = (cost: number) => assistant(cost, "estimate", {}, "p", [], { usage: { ...assistant(cost).message.usage, estimated: true } });
+  const denied = { isError: true, content: [{ type: "text", text: "Budget target unavailable." }] };
+
+  it("selects both tools by default and summarizes discounted spending and missing child usage separately", async () => {
+    const s = await setup({
+      settings: { discount: 50, stopAtBudget: true },
+      descendants: { [THREAD]: [CHILD] }, owners: { [GRANDCHILD]: CHILD },
+      budgets: { [THREAD]: { budget: 5, includeChildren: true } },
+      logs: { [THREAD]: [user("private prompt"), assistant(4)], [CHILD]: [estimate(3)] },
+    });
+    expect(s.harness.registrations.agentConfigurationProvider).toBeNull();
+    expect(s.harness.registrations.agentTools.map((t) => t.name)).toEqual(["burn_budget_status", "burn_set_budget"]);
+    const status = await call(s, "status", {});
+    expect(JSON.stringify(status)).not.toContain("private prompt");
+    expect(answer(status)).toMatchObject({
+      threadId: THREAD, own: { knownUsd: 2, coverage: "available", estimated: false },
+      family: { knownUsd: 3.5, coverage: "partial", estimated: true, childCount: 2, children: [
+        { threadId: CHILD, knownUsd: 1.5, estimated: true },
+        { threadId: GRANDCHILD, knownUsd: null, coverage: "missing" },
+      ] },
+      budget: { amount: 5, source: "thread", scope: "family", remainingUsd: 1.5, state: "ok" },
+      stopAtBudget: true,
+    });
+    expect(answer(await call(s, "status", { threadId: GRANDCHILD }))).toMatchObject({ threadId: GRANDCHILD });
+  });
+
+  it("caps child discovery at 50 even when no child has reported", async () => {
+    const ids = Array.from({ length: 51 }, (_, i) => `thr_child${i}`);
+    const s = await setup({ descendants: { [THREAD]: ids } });
+    const status = answer(await call(s, "status", {}));
+    expect(status.family.childCount).toBe(51);
+    expect(status.family.children).toHaveLength(50);
+    expect(status.family.children[0]).toMatchObject({ threadId: ids[0], coverage: "missing" });
+  });
+
+  it("refuses unrelated, deleted and unverified targets without leaking host errors", async () => {
+    const s = await setup({ descendants: { [THREAD]: [GRANDCHILD] }, deleted: new Set([GRANDCHILD]) });
+    expect(await call(s, "status", { threadId: CHILD })).toEqual(denied);
+    expect(await call(s, "set", { threadId: THREAD, amountUsd: 10 }, CHILD)).toEqual(denied);
+    expect(await call(s, "status", { threadId: GRANDCHILD })).toEqual(denied);
+    expect(await call(s, "status", {}, GRANDCHILD)).toEqual(denied);
+    s.harness.inspection.sdk.stub("threads.experimental_listDescendants", async () => { throw new Error("/private/location"); });
+    expect(await call(s, "set", { threadId: CHILD, amountUsd: 10 })).toEqual(denied);
+    expect(await call(s, "status", {})).toEqual(denied);
+    expect(s.harness.inspection.pendingInteractions).toHaveLength(0);
+  });
+
+  it("does not return family usage after a worker leaves during collection", async () => {
+    const owners = { [CHILD]: THREAD };
+    const s = await setup({ owners, logs: { [CHILD]: [assistant(2)] } });
+    const release = s.hold();
+    const status = call(s, "status", {});
+    try {
+      await vi.waitFor(() => expect(s.hostAsked()).toContain(CHILD));
+      owners[CHILD] = GRANDCHILD;
+    } finally {
+      release();
+    }
+    expect(await status).toEqual(denied);
+  });
+
+  it("returns a bounded status snapshot when the family grows during collection", async () => {
+    const descendants = { [THREAD]: [CHILD] };
+    const s = await setup({ descendants, logs: { [CHILD]: [assistant(2)] } });
+    const release = s.hold();
+    const status = call(s, "status", {});
+    try {
+      await vi.waitFor(() => expect(s.hostAsked()).toContain(CHILD));
+      descendants[THREAD].push(GRANDCHILD);
+    } finally {
+      release();
+    }
+    const spend = answer(await status);
+    expect(spend.family).toMatchObject({ knownUsd: 2, children: [{ threadId: CHILD }] });
+  });
+
+  it("rejects caller, scope, approval claims and invalid amounts", async () => {
+    const s = await setup();
+    for (const args of [{ amountUsd: 0 }, { amountUsd: -1 }, { amountUsd: null }, { amountUsd: "default" },
+      { amountUsd: 1_000_001 }, { amountUsd: 3, callerId: THREAD }, { amountUsd: 3, includeChildren: true }, { amountUsd: 3, approved: true }]) {
+      await expect(call(s, "set", args)).rejects.toThrow();
+    }
+    expect(await cap(s)).toBeUndefined();
+  });
+
+  it("adds and lowers an absolute cap without changing user policy or scope", async () => {
+    const s = await setup({ settings: { stopAtBudget: true, notifyExpensiveTurn: true, dailyBudget: 17 } });
+    await call(s, "set", { amountUsd: 5 });
+    expect(await cap(s)).toEqual({ budget: 5 });
+    await s.rpc("setBudget", { threadId: THREAD, budget: 5, includeChildren: true });
+    await call(s, "set", { amountUsd: 4 });
+    expect(await cap(s)).toEqual({ budget: 4, includeChildren: true });
+    expect((await s.usage()).policy).toMatchObject({ budget: 4, includeChildren: true, stopAtBudget: true, notifyExpensiveTurn: true });
+    expect(s.harness.inspection.pendingInteractions).toHaveLength(0);
+  });
+
+  it("refuses a self-increase from the applied default and directs the human to the editor", async () => {
+    const s = await setup({ settings: { threadBudget: 5 } });
+    expect(await call(s, "set", { amountUsd: 7.501 })).toEqual({
+      isError: true,
+      content: [{ type: "text", text: `Cannot raise ${THREAD} from USD 5 to USD 7.501 with this tool. Ask the human to change the amount in Burn's budget editor.` }],
+    });
+    expect(s.harness.inspection.pendingInteractions).toHaveLength(0);
+    expect(await cap(s)).toBeUndefined();
+    await s.rpc("setBudget", { threadId: THREAD, budget: 7.501 });
+    expect((await s.usage()).budget).toEqual({ amount: 7.501, source: "thread" });
+    expect((await s.usage(CHILD)).budget).toEqual({ amount: 5, source: "setting" });
+  });
+
+  it.each(["parent amount", "parent scope", "child amount", "child scope", "family spend"] as const)(
+    "does not use stale %s while collecting a delegation quote", async (change) => {
+      const s = await setup({
+        owners: { [CHILD]: THREAD },
+        budgets: { [THREAD]: { budget: 10, includeChildren: true }, [CHILD]: { budget: 3 } },
+        logs: { [THREAD]: [assistant(5)], [CHILD]: [assistant(2)] },
+      });
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const get = s.bb.storage.kv.get.bind(s.bb.storage.kv);
+      let readingQuote = false;
+      vi.spyOn(s.bb.storage.kv, "get").mockImplementation(async key => {
+        if (key === `stopped:${CHILD}` && !readingQuote) {
+          readingQuote = true;
+          await gate;
+        }
+        return get(key);
+      });
+      const setting = call(s, "set", { threadId: CHILD, amountUsd: 5 });
+      const id = change.startsWith("parent") ? THREAD : CHILD;
+      const next = change === "parent amount" ? 8 : change === "child amount" ? 2 : id === THREAD ? 10 : 3;
+      const shared = change === "parent amount" || change === "child scope";
+      let edit: Promise<unknown> | undefined;
+      try {
+        await vi.waitFor(() => expect(readingQuote).toBe(true));
+        if (change === "family spend") {
+          await s.spend(THREAD, assistant(2));
+        } else {
+          edit = s.rpc("setBudget", { threadId: id, budget: next, includeChildren: shared });
+          await vi.waitFor(async () => expect(await cap(s, id)).toEqual({ budget: next, ...(shared ? { includeChildren: true } : {}) }), { timeout: 500 });
+        }
+      } finally {
+        release();
+        await edit;
+      }
+      expect(await setting).toMatchObject({ isError: true });
+      expect(await cap(s, id)).toEqual({ budget: next, ...(shared ? { includeChildren: true } : {}) });
+      if (id === THREAD) expect(await cap(s, CHILD)).toEqual({ budget: 3 });
+      expect(s.harness.inspection.pendingInteractions).toHaveLength(0);
+    },
+  );
+
+  it.each(["reassigned", "deleted", "new family member", "aborted"] as const)(
+    "does not delegate from a stale family quote when %s", async (change) => {
+      const owners = { [CHILD]: THREAD, [GRANDCHILD]: "" };
+      const deleted = new Set<string>();
+      const s = await setup({
+        owners, deleted,
+        budgets: { [THREAD]: { budget: 10, includeChildren: true }, [CHILD]: { budget: 3 } },
+        logs: { [THREAD]: [assistant(5)], [CHILD]: [assistant(2)] },
+      });
+      const controller = new AbortController();
+      const release = s.hold();
+      const setting = call(s, "set", { threadId: CHILD, amountUsd: 5 }, THREAD, controller.signal);
+      try {
+        await vi.waitFor(() => expect(s.hostAsked()).toContain(CHILD));
+        if (change === "reassigned") owners[CHILD] = GRANDCHILD;
+        if (change === "deleted") deleted.add(CHILD);
+        if (change === "new family member") {
+          owners[GRANDCHILD] = THREAD;
+          await s.harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id: GRANDCHILD, lifecycleOwnerThreadId: THREAD }) });
+        }
+        if (change === "aborted") controller.abort();
+      } finally {
+        release();
+      }
+      expect(await setting).toMatchObject({ isError: true });
+      expect(await cap(s, CHILD)).toEqual({ budget: 3 });
+      expect(s.harness.inspection.pendingInteractions).toHaveLength(0);
+    },
+  );
+
+  it("lets the shared parent set and raise a worker cap that fits its family remainder", async () => {
+    const s = await setup({
+      owners: { [CHILD]: THREAD }, budgets: { [THREAD]: { budget: 10, includeChildren: true } },
+      logs: { [THREAD]: [assistant(5)], [CHILD]: [assistant(2)] },
+    });
+    expect(answer(await call(s, "set", { threadId: CHILD, amountUsd: 4 }))).toMatchObject({ budget: { amount: 4 } });
+    const before = s.harness.inspection.sdk.callsTo("threads.list").length;
+    expect(answer(await call(s, "set", { threadId: CHILD, amountUsd: 5 }))).toMatchObject({ budget: { amount: 5 } });
+    expect(s.harness.inspection.sdk.callsTo("threads.list")).toHaveLength(before + 1);
+    expect(await cap(s, THREAD)).toEqual({ budget: 10, includeChildren: true });
+    expect(await cap(s, CHILD)).toEqual({ budget: 5 });
+    expect(s.harness.inspection.pendingInteractions).toHaveLength(0);
+  });
+
+  it.each(["no family cap", "past remaining", "missing report", "unpriced report", "estimated report"] as const)(
+    "refuses a worker increase with %s", async (reason) => {
+      const s = await setup({
+        owners: { [CHILD]: THREAD },
+        budgets: { [THREAD]: { budget: 10, includeChildren: reason !== "no family cap" }, [CHILD]: { budget: 3 } },
+        logs: { [THREAD]: [assistant(5)], ...(reason === "missing report" ? {} : { [CHILD]: [
+          ...(reason === "unpriced report" ? [assistant(0), ...Array.from({ length: 61 }, () => assistant(0.01))] : reason === "estimated report" ? [estimate(2)] : [assistant(2)]),
+        ] }) },
+      });
+      const amount = reason === "past remaining" ? 6 : 4;
+      expect(await call(s, "set", { threadId: CHILD, amountUsd: amount })).toEqual({
+        isError: true,
+        content: [{ type: "text", text: `Cannot raise ${CHILD} from USD 3 to USD ${amount} with this tool. Ask the human to change the amount in Burn's budget editor.` }],
+      });
+      expect(await cap(s, CHILD)).toEqual({ budget: 3 });
+      expect(s.harness.inspection.pendingInteractions).toHaveLength(0);
+    },
+  );
+});
+
 const envelope = (sentAt: number, over: Partial<UsageReport> = {}, threadId = THREAD) => ({ threadId, sentAt, report: sampleReport(over) });
 const costOf = (total: number): Partial<UsageReport> => ({ cost: { input: total, output: 0, cacheRead: 0, cacheWrite: 0, total } });
 const QUIET = { budget: null, stopAtBudget: false, notifyExpensiveTurn: false };
@@ -215,9 +443,9 @@ describe("settings", () => {
     const stop = s.harness.inspection.registrations.settingsDescriptors.stopAtBudget;
     expect(stop).toMatchObject({ type: "boolean", label: "Stop a thread at its budget", default: false });
     expect(stop?.description).toMatch(/^Off by default/);
-    expect(stop?.description).toContain("Burn stops the run whose cost crosses the thread's budget");
+    expect(stop?.description).toContain("Burn stops the current work through bb when its discounted cost crosses a budget set in bb");
+    expect(stop?.description).toContain("including for pi threads");
     expect(stop?.description).toContain("Send another prompt to continue");
-    expect(stop?.description).toContain("otherwise Burn stops the thread's current work through bb");
     expect(stop?.description).toContain("Claude Code threads are not stopped");
     expect(SETTINGS.notifyExpensiveTurn.description).toContain("at least 3 times the thread's median turn and at least $0.50");
   });
@@ -246,7 +474,7 @@ describe("settings", () => {
   it("puts back the settings bb forgot when the plugin was removed", async () => {
     // bb deletes a plugin's settings on removal but keeps its storage, so this is what a reinstall finds.
     const s = await setup({ settingsCopy: { discount: 15, threadBudget: 10, stopAtBudget: true, chip: false } });
-    expect(await (await s.post(envelope(1))).json()).toMatchObject({ policy: { budget: 10, stopAtBudget: true } });
+    expect((await s.usage()).policy).toMatchObject({ budget: 10, stopAtBudget: true });
     const kept = (await s.bb.storage.kv.get(SETTINGS_COPY_KEY)) as Record<string, unknown>;
     expect(kept).toMatchObject({ discount: 15, threadBudget: 10, stopAtBudget: true, chip: false });
   });
@@ -348,11 +576,12 @@ describe("POST /usage", () => {
     expect((await send(usageToken(secret as string, THREAD))).status).toBe(200);
   });
 
-  it("hands pi bb's budget: the thread's own, else the setting, and the stop setting as set", async () => {
-    const s = await setup({ settings: { threadBudget: 10, stopAtBudget: true } });
-    expect(await (await s.post(envelope(1))).json()).toEqual({ ok: true, policy: { budget: 10, stopAtBudget: true, notifyExpensiveTurn: false } });
-    await s.rpc("setBudget", { threadId: THREAD, budget: 4 });
-    expect((await (await s.post(envelope(2))).json()).policy.budget).toBe(4);
+  it("gives legacy pi the BB cap and scope but disables Pi-side stops and expensive notices", async () => {
+    const s = await setup({ settings: { threadBudget: 10, stopAtBudget: true, notifyExpensiveTurn: true } });
+    expect(await (await s.post(envelope(1))).json()).toEqual({ ok: true, policy: { ...QUIET, budget: 10 } });
+    await s.rpc("setBudget", { threadId: THREAD, budget: 4, includeChildren: true });
+    expect((await (await s.post(envelope(2))).json()).policy).toEqual({ ...QUIET, budget: 4, includeChildren: true });
+    expect((await s.usage()).policy).toEqual({ budget: 4, includeChildren: true, stopAtBudget: true, notifyExpensiveTurn: true });
     await s.rpc("setBudget", { threadId: THREAD, budget: null });
     expect((await (await s.post(envelope(3))).json()).policy.budget).toBeNull();
     await s.rpc("setBudget", { threadId: THREAD, budget: "default" });
@@ -369,11 +598,11 @@ describe("POST /usage", () => {
     expect(s.signals()).toEqual([]);
   });
 
-  it("ignores a report older than the stored one but still answers with the policy", async () => {
-    const s = await setup();
+  it("ignores a stale legacy report but still replies with local enforcement off", async () => {
+    const s = await setup({ settings: { threadBudget: 11, stopAtBudget: true, notifyExpensiveTurn: true } });
     await s.post(envelope(10, { calls: 5 }));
     const stale = await s.post(envelope(5, { calls: 1 }));
-    expect(await stale.json()).toEqual({ ok: true, policy: QUIET });
+    expect(await stale.json()).toEqual({ ok: true, policy: { ...QUIET, budget: 11 } });
     expect((await s.usage()).report).toMatchObject({ calls: 5 });
     expect(s.signals()).toHaveLength(1);
   });
@@ -1078,7 +1307,7 @@ describe("budgets including child threads", () => {
   });
 });
 
-describe("stop at budget, for threads without the pi extension", () => {
+describe("BB stops at budget", () => {
   const settle = () => new Promise((resolve) => setTimeout(resolve, 30));
   const logs = () => ({ [THREAD]: [user(), assistant(9)] });
   const ON = { threadBudget: 10, stopAtBudget: true };
@@ -1120,15 +1349,42 @@ describe("stop at budget, for threads without the pi extension", () => {
     expect(s.stops()).toEqual([]);
   });
 
-  it("never stops a thread whose pi extension has reported, which stops its own run", async () => {
-    const s = await setup({ settings: ON, statuses: { [THREAD]: "active" }, logs: logs() });
-    await s.post(envelope(1, costOf(9)));
+  it("stops a fresh legacy Pi reporter once at the discounted crossing, not at the raw crossing", async () => {
+    const s = await setup({
+      settings: { threadBudget: 5, discount: 50, stopAtBudget: true },
+      statuses: { [THREAD]: "active" }, logs: { [THREAD]: [user(), assistant(4)] },
+    });
+    await s.post(envelope(1, costOf(4)));
     await settle();
     await run(s, 2);
+    expect(await s.usage()).toMatchObject({ source: "pi", report: { cost: { total: 3 } }, policy: { stopAtBudget: true } });
+    expect(await s.rpc("usage", { threadId: THREAD, listPrice: true })).toMatchObject({ report: { cost: { total: 6 } } });
+    expect(s.stops()).toEqual([]);
+
+    await s.spend(THREAD, assistant(5));
+    await vi.waitFor(() => expect(s.stops()).toHaveLength(1));
+    expect(await s.usage()).toMatchObject({ report: { cost: { total: 5.5 } } });
+    await s.spend(THREAD, assistant(1));
+    await settle();
+    expect(s.stops()).toEqual([[{ threadId: THREAD }]]);
+    expect((await s.usage()).report).toMatchObject({ cost: { total: 6 }, stoppedAt: expect.any(Number) });
+    expect(s.alerts().filter(a => a.kind === "stopped")).toHaveLength(1);
+  });
+
+  it.each([false, true])("does not enforce a legacy Pi-only budget when the BB cap is unset or cleared (%s)", async cleared => {
+    const s = await setup({
+      settings: { stopAtBudget: true, ...(cleared ? { threadBudget: 5 } : {}) },
+      statuses: { [THREAD]: "active" }, logs: { [THREAD]: [user(), assistant(4)] },
+    });
+    if (cleared) await s.rpc("setBudget", { threadId: THREAD, budget: null });
+    await s.post(envelope(1, { ...costOf(4), budget: 5 }));
+    await settle();
+    await run(s, 2);
+    expect(await s.usage()).toMatchObject({ budget: { amount: 5, source: "pi" }, policy: { budget: null, stopAtBudget: true } });
     expect(s.stops()).toEqual([]);
   });
 
-  it("stops a thread whose stored pi report is stale, since no extension is reporting now", async () => {
+  it("stops a thread with a stale legacy Pi report as well", async () => {
     const stale = { report: sampleReport(costOf(9)), sentAt: 1, at: Date.now() - 10 * 60_000 };
     const s = await setup({ settings: ON, statuses: { [THREAD]: "active" }, logs: logs(), reports: { [THREAD]: stale } });
     await run(s, 2);

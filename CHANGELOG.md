@@ -4,6 +4,10 @@ Notable changes to Burn, newest first.
 
 Burn follows [semantic versioning](https://semver.org). Releases from 0.4.0 on are tagged `vX.Y.Z` in this repository; earlier versions were not tagged. Each release's commit message has the full detail, including how the release was checked.
 
+## Unreleased
+
+- **Burn no longer stalls bb on a busy server.** Burn's code runs on bb's server thread, and every change to any thread used to make it work out the costs and over-budget flags of every thread again, for every open window. Cost rows are now kept per thread and worked out again only when that thread or one of its children changes, the over-budget flags read only threads that can have a budget, and the per-thread caches hold 5000 threads instead of 500.
+
 ## 0.12.0 - 2026-11-28
 
 Burn adds spend graphs and agent budget tools in BB, fixes early budget stops in BB-managed Pi, and restores usage figures for OpenCode v2 threads.

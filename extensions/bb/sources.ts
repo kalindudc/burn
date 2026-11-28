@@ -74,6 +74,8 @@ export interface ReportSource {
   missingLog(threadId: string): { searched: string[] } | null;
   /** Read the thread from its machine again on the next read, as after its pi named a new session log. */
   invalidate(threadId: string): void;
+  /** Bumped each time the source drops this thread's figures to read it again, so a cache built on its report knows it is stale. */
+  version(threadId: string): number;
   /** The thread's log is in a folder its machine does not watch, so a report from its pi is the only news that it changed. */
   unwatched(threadId: string): boolean;
   /** Reads these threads' details in the background, so a page over them does not start cold. */
@@ -741,6 +743,9 @@ export function createReportSource(
   });
 
   return {
+    version(threadId) {
+      return versions.get(threadId) ?? 0;
+    },
     missingLog(threadId) {
       const found = missing.get(threadId);
       return found === undefined ? null : { searched: found.searched };

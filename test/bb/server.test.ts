@@ -1041,6 +1041,28 @@ describe("what each call reads", () => {
     expect(list.mock.calls.filter(([prefix]) => String(prefix).startsWith("report:"))).toHaveLength(1);
   });
 
+  it("answers a repeated cost call from the rows it worked out, and works a row out again once its thread changes", async () => {
+    const s = await setup({ logs: { [THREAD]: [user(), assistant(2)] } });
+    const cost = async () => (await s.rpc<{ threads: { cost: number }[] }>("costs", { threadIds: [THREAD] })).threads[0]?.cost;
+    expect(await cost()).toBeCloseTo(2);
+    const listed = s.harness.sdk.callsTo("threads.experimental_listDescendants").length;
+    expect(await cost()).toBeCloseTo(2);
+    expect(await cost()).toBeCloseTo(2);
+    expect(s.harness.sdk.callsTo("threads.experimental_listDescendants")).toHaveLength(listed);
+    await s.spend(THREAD, assistant(3));
+    await vi.waitFor(async () => expect(await cost()).toBeCloseTo(5));
+  });
+
+  it("reads no figures for the over-budget flags when no thread can have a budget", async () => {
+    const others = Array.from({ length: 20 }, (_, n) => id(n));
+    const s = await setup({ logs: Object.fromEntries([THREAD, ...others].map((t) => [t, [user(), assistant(1)]])), listed: [row(THREAD), ...others.map((t) => row(t))] });
+    expect((await s.rpc<{ threads: unknown[] }>("overBudget", {})).threads).toEqual([]);
+    expect(s.hostAsked().filter((t) => others.includes(t))).toEqual([]);
+    await s.rpc("setBudget", { threadId: others[3], budget: 0.5 });
+    const flagged = await s.rpc<{ threads: { threadId: string }[] }>("overBudget", {});
+    expect(flagged.threads.map((t) => t.threadId)).toEqual([others[3]]);
+  });
+
   it("starts a fresh read when figures change while an older read is in flight", async () => {
     const s = await setup({ logs: { [THREAD]: [user(), assistant(2)] } });
     const settle = () => new Promise((resolve) => setTimeout(resolve, 20));

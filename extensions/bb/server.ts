@@ -10,7 +10,7 @@ import { ALERT_CHANNEL } from "./alerts.js";
 import { effectiveBudget, type OwnBudget, policyFor, positiveOrNull } from "./budgets.js";
 import { BUDGET_MAX, budgetAmountSchema, budgetTargetSchema, type CostRow, type Family, rpcContract } from "./contract.js";
 import { createThreadDirectory, type ThreadRow } from "./directory.js";
-import { budgetKey, logKey, REPORT_PREFIX, reportKey, SETTINGS_COPY_KEY, stoppedKey } from "./keys.js";
+import { BUDGET_PREFIX, budgetKey, logKey, REPORT_PREFIX, reportKey, SETTINGS_COPY_KEY, stoppedKey } from "./keys.js";
 import { alertEvents, alertFor } from "./notify.js";
 import { discountsOf } from "./prefs.js";
 import { type Stored, storedSchema, usageEnvelopeSchema } from "./schema.js";
@@ -24,7 +24,11 @@ export { rpcContract } from "./contract.js";
 
 // The report is stored as one plugin KV value, which bb caps at 256 KiB.
 const REPORT_MAX_BYTES = 240 * 1024;
-const MAX_THREADS = 500;
+// Per-thread caches hold every thread a busy bb has, not just the newest few hundred: an evicted entry costs a KV read and a parse on the next pass.
+const MAX_THREADS = 5000;
+/** How long a computed cost row is served without recomputing when no change about its thread arrived. */
+const ROW_TTL_MS = 60_000;
+
 const TITLE_TTL_MS = 60_000;
 const CHILD_DETAIL_LIMIT = 50;
 const UNTITLED = "Untitled thread";
@@ -368,17 +372,22 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
    * not list (one created since the last listing); every thread that reported
    * when bb cannot list them.
    */
-  async function threadsWhere(keep: (thread: ThreadRow) => boolean): Promise<string[]> {
-    const reported = (await bb.storage.kv.list(REPORT_PREFIX)).map((key) => key.slice(REPORT_PREFIX.length));
+  async function threadsWhere(keep: (thread: ThreadRow) => boolean, listed?: readonly string[]): Promise<string[]> {
+    const reported = listed ?? (await reportedIds());
     let rows: ThreadRow[];
     try {
       rows = await directory.all();
     } catch (err) {
       bb.log.warn(`listing threads failed, so only reporting threads count: ${message(err)}`);
-      return reported;
+      return [...reported];
     }
     const known = new Set(rows.map((t) => t.id));
     return [...rows.filter(keep).map((t) => t.id), ...reported.filter((id) => !known.has(id))];
+  }
+
+  /** The threads with a report their pi sent, from the KV keys alone. */
+  async function reportedIds(): Promise<string[]> {
+    return (await bb.storage.kv.list(REPORT_PREFIX)).map((key) => key.slice(REPORT_PREFIX.length));
   }
 
   /** Reports of every thread that may have spent since `since`: active since then, or running now. */
@@ -728,24 +737,64 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       return { report, source: own?.source ?? null, reportedAt: own?.at ?? null, title, budget, policy, family, missingLog: report === null ? source.missingLog(threadId) : null };
     },
   );
+  // The cost rows already worked out. A change about a thread drops its row (changed() also names its parents, whose family total moves);
+  // anything wider (settings, the thread list) drops them all. A row computed while a change about it arrived is not kept.
+  // `sources` is the report source's version of each thread the row was built from, which moves when the source drops what it read.
+  const rows = new Map<string, { row: CostRow; at: number; sources: [string, number][] }>();
+  const sourcesCurrent = (held: { sources: [string, number][] }): boolean => held.sources.every(([id, v]) => source.version(id) === v);
+  const rowVersions = new Map<string, number>();
+  let rowsEpoch = 0;
+  function dropRows(threadIds?: readonly string[]): void {
+    if (threadIds === undefined) {
+      rows.clear();
+      rowsEpoch++;
+      return;
+    }
+    for (const id of threadIds) {
+      rows.delete(id);
+      remember(rowVersions, id, (rowVersions.get(id) ?? 0) + 1);
+    }
+  }
   const costsRead = coalesce(
     ({ threadIds }: { threadIds: string[] }) => JSON.stringify(threadIds),
     async ({ threadIds }) => {
-      const [descendants, values] = await Promise.all([descendantsOf(threadIds), settings.get()]);
-      const resolved = await resolveMany([...threadIds, ...[...descendants.values()].flat()]);
-      return {
-        threads: await Promise.all(
-          threadIds.map((id) => costRow(id, resolved.get(id)?.report ?? null, reportsIn(resolved, descendants.get(id) ?? []), values)),
-        ),
-      };
+      const now = Date.now();
+      const missing = [...new Set(threadIds.filter((id) => {
+        const held = rows.get(id);
+        return held === undefined || now - held.at >= ROW_TTL_MS || !sourcesCurrent(held);
+      }))];
+      const fresh = new Map<string, CostRow>();
+      if (missing.length > 0) {
+        const epoch = rowsEpoch;
+        const versions = new Map(missing.map((id) => [id, rowVersions.get(id) ?? 0]));
+        const [descendants, values] = await Promise.all([descendantsOf(missing), settings.get()]);
+        const sourceVersions = new Map(missing.map((id) => [id, [id, ...(descendants.get(id) ?? [])].map((t): [string, number] => [t, source.version(t)])]));
+        const resolved = await resolveMany([...missing, ...[...descendants.values()].flat()]);
+        await Promise.all(
+          missing.map(async (id) => {
+            const row = await costRow(id, resolved.get(id)?.report ?? null, reportsIn(resolved, descendants.get(id) ?? []), values);
+            fresh.set(id, row);
+            if (epoch === rowsEpoch && (rowVersions.get(id) ?? 0) === versions.get(id)) remember(rows, id, { row, at: now, sources: sourceVersions.get(id) ?? [] });
+          }),
+        );
+      }
+      return { threads: threadIds.map((id) => (fresh.get(id) ?? rows.get(id)?.row) as CostRow) };
     },
   );
   const overBudgetRead = coalesce(
     () => "all",
     async () => {
       // The sidebar shows no archived thread, so none is read for its flag.
-      const ids = [...new Set(await threadsWhere((t) => t.archivedAt === null))];
       const values = await settings.get();
+      const reported = await reportedIds();
+      let ids = [...new Set(await threadsWhere((t) => t.archivedAt === null, reported))];
+      // Without the Thread budget setting, only a thread with its own budget or one its pi reported can be over:
+      // the rest are not read at all, so a sidebar refresh no longer resolves every thread's figures.
+      if (positiveOrNull(values.threadBudget) === null) {
+        const own = (await bb.storage.kv.list(BUDGET_PREFIX)).map((key) => key.slice(BUDGET_PREFIX.length));
+        const candidates = new Set([...own, ...reported]);
+        ids = ids.filter((id) => candidates.has(id));
+      }
       const shared = (await Promise.all(ids.map(async id => (await budgetOf(id, null, values))?.includeChildren ? id : null))).filter(id => id !== null);
       const descendants = shared.length ? await descendantsOf(shared, true) : new Map<string, string[]>();
       const resolved = await resolveMany([...ids, ...[...descendants.values()].flat()]);
@@ -767,6 +816,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   const spendRead = coalesce((input) => JSON.stringify(input), spendHandlers.spend);
   readsChanged = (threadIds) => {
     if (threadIds === undefined) {
+      dropRows();
       usageRead.invalidate();
       costsRead.invalidate();
       overBudgetRead.invalidate();
@@ -774,6 +824,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       return;
     }
     if (threadIds.length === 0) return;
+    dropRows(threadIds);
     usageRead.invalidate((key) => threadIds.some((id) => key.startsWith(`${id}:`)));
     // A cost row includes the thread's family, so a change in any family member can move it.
     costsRead.invalidate();
@@ -1054,11 +1105,18 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   ] : []);
 
   // A thread moving in or out of the archive moves in or out of the sidebar's flags.
+  // Archiving moves no figure (a family counts archived children too), so only this thread and its parents are looked at again.
+  // A thread that changed parents leaves a family the event does not name, so every row is worked out again then.
   for (const name of ["thread.created", "thread.archived", "thread.unarchived", "experimental_thread.parentChanged"] as const) {
-    bb.events.on(name, () => {
+    bb.events.on(name, ({ thread }) => {
       familyGeneration++;
       directory.refresh();
-      readsChanged();
+      if (name === "experimental_thread.parentChanged") {
+        readsChanged();
+        return;
+      }
+      const about = [thread.id, thread.parentThreadId, thread.lifecycleOwnerThreadId].filter((id): id is string => typeof id === "string" && id.length > 0);
+      readsChanged(about);
     });
   }
 
@@ -1081,7 +1139,8 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     } catch (err) {
       bb.log.warn(`forgetting the usage report of ${thread.id} failed: ${message(err)}`);
     }
-    readsChanged([thread.id]);
+    // A deleted child leaves its parents' family totals, and the event does not say who they were.
+    readsChanged();
   });
 
   // Read the details of the threads the Burn page is most likely to ask about, so its first open

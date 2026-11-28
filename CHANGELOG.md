@@ -6,11 +6,17 @@ Burn follows [semantic versioning](https://semver.org). Releases from 0.4.0 on a
 
 ## 0.12.0 - 2026-11-28
 
+Burn adds spend graphs and agent budget tools in BB, fixes early budget stops in BB-managed Pi, and restores usage figures for OpenCode v2 threads.
+
 **NOTICE:** Burn now enables `burn_budget_status` and `burn_set_budget` by default in BB. Agents can inspect budgets for their own threads and descendants and add or lower the same cap you see in the budget editor. The native tool refuses increases unless a parent raises a descendant's cap within its existing shared family budget. Otherwise, change the cap yourself in Burn's budget editor.
 
 - **Spend over time in the thread panel and the Day view.** The Burn tab plots cumulative thread spend at recorded call times and uses hourly totals where finer timing is unavailable. The Burn page's Day Cost view charts the selected day by hour without removing the spend-by-model bar. Both call out incomplete timing, and the graph shows a budget guide only when it applies to the plotted spend.
 - **BB-managed Pi stops at discounted cost.** The standalone Burn Pi extension stays inactive when BB starts Pi. Burn's BB plugin owns budget stops and uses the same discounted spend it shows in the panel. It still accepts reports from older extensions while asking them not to stop runs. Update both packages if you use both, and restart any BB-managed Pi thread that had loaded the old extension.
-- Read OpenCode v2 threads (`opencode2` provider) from OpenCode's own database, as classic OpenCode threads already are. Calls, tokens and child sessions appear instead of nothing, and a route that records a zero cost is priced from models.dev and marked an estimate.
+- **OpenCode v2 threads show usage again.** Burn reads calls, tokens, and child sessions from OpenCode's database. When a route reports zero cost and Burn knows its rates, it estimates the cost and marks it with `~`. If the database is unavailable, Burn falls back to the usage BB recorded and marks coverage as limited. ([#23](https://github.com/kalindudc/burn/issues/23), [#24](https://github.com/kalindudc/burn/pull/24))
+
+### Contributors
+
+- [Sergey Dreyzin](https://github.com/serjdrej) reported the missing OpenCode v2 usage ([#23](https://github.com/kalindudc/burn/issues/23)) and contributed the fix ([#24](https://github.com/kalindudc/burn/pull/24)).
 
 ## 0.11.2 - 2026-11-21
 

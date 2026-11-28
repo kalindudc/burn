@@ -29,6 +29,8 @@ export interface ThreadRow {
 export interface ThreadDirectory {
   /** Every thread bb knows up to the page cap, archived and hidden included, listed at most once a TTL. */
   all(): Promise<ThreadRow[]>;
+  /** A fresh, complete listing for decisions that cannot use stale ownership edges. */
+  allLive(signal: AbortSignal): Promise<ThreadRow[]>;
   /** One thread's row; null when bb has no such thread. */
   one(threadId: string): Promise<ThreadRow | null>;
   /** Forget the cached listing, so the next read lists again (a thread archived, unarchived or deleted). */
@@ -84,18 +86,25 @@ export function createThreadDirectory(bb: BbPluginApi, opts: { now?: () => numbe
   // A direct read under way per thread, so concurrent callers join it instead of asking bb again.
   const directing = new Map<string, Promise<ThreadRow | null>>();
 
+  async function readRows(signal?: AbortSignal): Promise<ThreadRow[]> {
+    const rows: ThreadRow[] = [];
+    const listedAt = now();
+    for (let page = 0; page < PAGES_MAX; page++) {
+      signal?.throwIfAborted();
+      const got = await bb.sdk.threads.list({ includeHidden: true, limit: PAGE, offset: page * PAGE, ...(signal ? { signal } : {}) });
+      for (const t of got) if (t.deletedAt === null) rows.push(toRow(t, listedAt));
+      if (got.length < PAGE) return rows;
+    }
+    if (signal) throw new Error("The thread directory exceeded its page limit.");
+    return rows;
+  }
+
   async function list(): Promise<Listing> {
     if (held && now() - held.at < TTL_MS) return held;
     if (running) return running;
     const mine = generation;
     const taking = (async () => {
-      const rows: ThreadRow[] = [];
-      const listedAt = now();
-      for (let page = 0; page < PAGES_MAX; page++) {
-        const got = await bb.sdk.threads.list({ includeHidden: true, limit: PAGE, offset: page * PAGE });
-        for (const t of got) if (t.deletedAt === null) rows.push(toRow(t, listedAt));
-        if (got.length < PAGE) break;
-      }
+      const rows = await readRows();
       const found: Listing = { at: now(), rows, byId: new Map(rows.map((r) => [r.id, r])) };
       if (mine === generation) held = found;
       return found;
@@ -153,6 +162,12 @@ export function createThreadDirectory(bb: BbPluginApi, opts: { now?: () => numbe
   return {
     async all() {
       return (await list()).rows;
+    },
+    async allLive(signal) {
+      const mine = generation;
+      const rows = await readRows(signal);
+      if (mine === generation) held = { at: now(), rows, byId: new Map(rows.map(row => [row.id, row])) };
+      return rows;
     },
     async one(threadId) {
       const found = await list();

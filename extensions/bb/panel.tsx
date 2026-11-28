@@ -18,10 +18,14 @@ import { AgentRows, CostBreakdown, agentLabel } from "./agents.js";
 import { BudgetEditor } from "./budget-editor.js";
 import { BudgetStatus, CopyAction, EstimatedNote, Label, MissingLogNotice, Models, StoppedNotice, WaitingNotice, WhereItWent } from "./card.js";
 import { MiniBars } from "./charts.js";
+import type { EffectiveBudget } from "./budgets.js";
 import type { Family, UsageAnswer } from "./contract.js";
 import { childUsageCount } from "./family.js";
 import { cn } from "./lib/utils.js";
 import { readPrefs } from "./prefs.js";
+import { spendTimeLabel } from "./spend-axis.js";
+import { CumulativeSpendChart } from "./spend-chart.js";
+import { buildSpendHistory } from "./spend-history.js";
 import { copySummary } from "./summary.js";
 import { useUsage } from "./usage.js";
 
@@ -70,6 +74,45 @@ function Kpis({ answer, report, atList }: { answer: UsageAnswer; report: UsageRe
       <Kpi label="Cache" value={report.cacheHitPct !== null ? `${report.cacheHitPct.toFixed(0)}%` : "—"} sub="hit rate" />
       <Kpi label="Speed" value={speed !== null ? formatSpeed(speed) : "—"} sub={speed !== null ? "output, timed calls" : "no timed calls"} />
     </div>
+  );
+}
+
+function ThreadSpend({ report, atList, budget }: { report: UsageReport; atList: boolean; budget: EffectiveBudget | null }): ReactNode {
+  const history = buildSpendHistory(report);
+  const amount = (n: number) => formatAmount(n, report.estimated);
+  const title = "Spend over time";
+  if (history === null) {
+    return (
+      <section aria-label={title}>
+        <Label aside="this thread">{title}</Label>
+        <p className="text-xs text-muted-foreground">
+          {report.cost.total > 0 ? `${amount(report.cost.total)} not plotted: no usable spend history.` : "No priced spend to plot."}
+        </p>
+      </section>
+    );
+  }
+  const { points, from, to, carried, unplotted, plotted, hasHourly } = history;
+  const budgetUsd = budget !== null && !atList && !budget.includeChildren && budget.amount / 2 <= plotted ? budget.amount : undefined;
+  const start = spendTimeLabel(from);
+  const end = spendTimeLabel(to);
+  const span = from === to ? `at ${end}` : `from ${start} to ${end}`;
+  const turnMarkers = report.turns.filter((turn) => turn.n > 0 && turn.at >= from && turn.at <= to).map((turn) => turn.at);
+  const summary = [
+    `Cumulative spend for this thread: ${amount(plotted)} plotted ${span}, local time.`,
+    budgetUsd !== undefined ? `${formatBudget(budgetUsd)} thread budget.` : "",
+    turnMarkers.length > 0 ? "Baseline marks show recorded turn starts." : "",
+  ].filter(Boolean).join(" ");
+  return (
+    <section aria-label={title}>
+      <Label aside="this thread">{title}</Label>
+      <CumulativeSpendChart points={points} from={from} to={to} estimated={report.estimated} ariaLabel={summary}
+        budgetUsd={budgetUsd} turnMarkers={turnMarkers} showOpening={carried > 0} />
+      <p className="mt-1 text-[11px] text-muted-foreground">
+        {hasHourly ? "Hourly amounts are spread within each hour. " : null}Dot: end of recorded history.
+      </p>
+      {carried > 0 ? <p className="mt-1 text-[11px] text-muted-foreground">Starts at {amount(carried)}: earlier spend has no hourly detail.</p> : null}
+      {unplotted > 0 ? <p className="mt-1 text-[11px] text-muted-foreground">{amount(unplotted)} not plotted: timing unavailable.</p> : null}
+    </section>
   );
 }
 
@@ -324,6 +367,7 @@ export function BurnPanel({ threadId, params }: PluginThreadPanelProps): ReactNo
       {report?.coverageNote ? <p className="text-xs text-warning-text">{report.coverageNote}</p> : null}
       {report?.estimated ? <EstimatedNote /> : null}
       {report?.stoppedAt != null ? <StoppedNotice stoppedAt={report.stoppedAt} budget={budget} /> : null}
+      {report !== null ? <ThreadSpend report={report} atList={atList} budget={budget} /> : null}
       {report !== null ? <Turns report={report} /> : null}
       {report !== null ? <FamilyList answer={answer} report={report} onOpen={(id) => navigate.toThread(id)} /> : null}
       <section data-testid="panel-budget">

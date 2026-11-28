@@ -7,6 +7,7 @@ import { dayDate, localDays } from "../../extensions/bb/spend/days.js";
 import { READING_DELAY_MS, READING_HOLD_MS, REFETCH_DEBOUNCE_MS, SpendPage } from "../../extensions/bb/spend/page.js";
 import { PANELS } from "../../extensions/bb/spend/panels.js";
 import { loadView, VIEW_KEY } from "../../extensions/bb/spend/view.js";
+import { HOUR_MS } from "../../src/report.js";
 
 const slots: RenderedSlot[] = [];
 afterEach(() => {
@@ -184,6 +185,100 @@ function render(server: ReturnType<typeof backend>, subPath = "", settings: Reco
   slots.push(slot);
   return slot;
 }
+
+describe("Day Cost chart", () => {
+  const start = Date.UTC(2026, 9, 18);
+  const hourlyCost: NonNullable<SpendOutput["hourlyCost"]> = {
+    start,
+    end: start + 8.5 * HOUR_MS,
+    timeZone: "UTC",
+    hours: [{ at: start + HOUR_MS, cost: 5 }, { at: start + 8 * HOUR_MS, cost: 7.5 }],
+    omittedBoundaryCost: false,
+    budget: null,
+  };
+
+  it("shows known cumulative spend alongside the model bar and heatmap, without filling a missing amount", async () => {
+    const slot = render(backend((input) => output(input.range, { total: 23.6, estimated: true, reading: 1, hourlyCost, tz: "utc" })), "day");
+    const chart = within(await slot.findByRole("region", { name: "Spend over time" }));
+    const line = chart.getByRole("img", { name: "Cumulative spend from hourly data: ~$12.50. From Oct 18 00:00 to Oct 18 08:30 in UTC." });
+    const coords = line.querySelector("polyline")?.getAttribute("points")?.split(" ").map((pair) => pair.split(",").map(Number));
+    expect(coords).toHaveLength(5);
+    expect(coords?.[2]?.[1]).toBe(coords?.[3]?.[1]);
+    expect(coords?.[4]?.[0]).toBeGreaterThan(coords?.[3]?.[0] ?? 0);
+    expect(coords?.[4]?.[1]).toBeLessThan(coords?.[3]?.[1] ?? 0);
+    expect(chart.queryByText("Budget $50")).toBeNull();
+    expect(chart.getByText(/Hours shown add up to ~\$12\.50; the day total is ~\$23\.60\./)).toBeTruthy();
+    expect(chart.getByText(/Some reports are still loading\./)).toBeTruthy();
+    expect(slot.getByRole("img", { name: "Today by model: ~$23.60" })).toBeTruthy();
+    expect(slot.getByRole("heading", { name: /Activity/ })).toBeTruthy();
+  });
+
+  it("draws the guide when coverage is complete within arithmetic precision and reads the span in the server time zone", async () => {
+    const localStart = start + 4 * HOUR_MS;
+    const hours = {
+      ...hourlyCost, start: localStart, end: localStart + 8.5 * HOUR_MS, timeZone: "America/Toronto", budget: 0.60,
+      hours: [{ at: localStart, cost: 0.1 }, { at: localStart + HOUR_MS, cost: 0.2 }],
+    };
+    const slot = render(backend((input) => output(input.range, { total: 0.3, hourlyCost: hours })), "day");
+    const chart = within(await slot.findByRole("region", { name: "Spend over time" }));
+    expect(chart.getByText("Budget $0.60")).toBeTruthy();
+    expect(chart.queryByText(/Hours shown add up to/)).toBeNull();
+    expect(chart.getByRole("img", {
+      name: "Cumulative spend from hourly data: $0.30. From Oct 18 00:00 to Oct 18 08:30 in America/Toronto. Daily budget $0.60.",
+    })).toBeTruthy();
+  });
+
+  it.each([
+    { reason: "discounted hours overstate exact Day spend", cost: 7.5, total: 5, budget: 6 },
+    { reason: "retained hours understate exact Day spend", cost: 5, total: 7.5, budget: 6 },
+    { reason: "near-identical amounts disagree on reaching the budget", cost: 5.999999999, total: 6, budget: 6 },
+    { reason: "a midnight bucket was omitted", cost: 5, total: 5, budget: 6, omittedBoundaryCost: true },
+    { reason: "some reports are still loading", cost: 5, total: 5, budget: 6, reading: 1 },
+    { reason: "the budget is more than twice the plotted spend", cost: 3, total: 3, budget: 200 },
+  ])("omits the guide when $reason", async ({ cost, total, budget, omittedBoundaryCost = false, reading = 0 }) => {
+    const hours = { ...hourlyCost, hours: [{ at: start, cost }], budget, omittedBoundaryCost };
+    const slot = render(backend((input) => output(input.range, { total, hourlyCost: hours, reading })), "day");
+    const chart = within(await slot.findByRole("region", { name: "Spend over time" }));
+    const img = chart.getByRole("img", { name: /Cumulative spend from hourly data/ });
+    expect(chart.queryByText(/^Budget /)).toBeNull();
+    expect(img.getAttribute("aria-label")).not.toMatch(/Daily budget/);
+  });
+
+  it("does not show a chart or a zero-cost claim when a positive Day total has no hourly dollars", async () => {
+    const slot = render(backend((input) => output(input.range, { total: 23.6, hourlyCost: { ...hourlyCost, hours: [], omittedBoundaryCost: true } })), "day");
+    const chart = within(await slot.findByRole("region", { name: "Spend over time" }));
+    expect(chart.getByText("No hourly dollar data for this day.")).toBeTruthy();
+    expect(chart.getByText(/Hours that cross midnight are omitted\./)).toBeTruthy();
+    expect(chart.queryByRole("img")).toBeNull();
+    expect(slot.getByRole("img", { name: "Today by model: $23.60" })).toBeTruthy();
+  });
+
+  it("keeps the existing multi-day charts and Day token and call views without a spend graph", async () => {
+    const server = backend((input) => output(input.range, { metric: input.metric ?? "cost", hourlyCost }));
+    const slot = render(server);
+    const days = () => within(slot.getByRole("list", { name: "Spend per day" })).getAllByRole("listitem");
+    await slot.findByRole("list", { name: "Spend per day" });
+    expect(days()).toHaveLength(7);
+    expect(slot.queryByRole("region", { name: "Spend over time" })).toBeNull();
+    fireEvent.click(slot.getByRole("button", { name: "30 days" }));
+    await waitFor(() => expect(days()).toHaveLength(30));
+    expect(slot.queryByRole("region", { name: "Spend over time" })).toBeNull();
+    fireEvent.click(slot.getByRole("button", { name: "Day" }));
+    expect(await slot.findByRole("region", { name: "Spend over time" })).toBeTruthy();
+    for (const [label, amount] of [["Tokens", "3.64B"], ["Calls", "14,942"]]) {
+      fireEvent.click(slot.getByRole("button", { name: label }));
+      expect(await slot.findByRole("img", { name: `Today by model: ${amount}` })).toBeTruthy();
+      expect(slot.queryByRole("region", { name: "Spend over time" })).toBeNull();
+    }
+  });
+
+  it("hides the entire Day chart when the chart panel is hidden", async () => {
+    const slot = render(backend((input) => output(input.range, { hourlyCost }), ["chart"]), "day");
+    await slot.findByText("$97.40");
+    expect(slot.queryByRole("region", { name: "Spend over time" })).toBeNull();
+    expect(slot.queryByRole("img", { name: /Today by model/ })).toBeNull();
+  });
+});
 
 describe("Spend page", () => {
   it("shows the KPIs, the daily chart with its legend and the costliest threads", async () => {

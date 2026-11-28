@@ -13,8 +13,8 @@ Burn puts a cost pill such as `$4.82 +$0.31` in pi's footer and in bb's prompt b
 **In bb**, for every thread, whatever harness runs it (pi, OpenCode, Codex, Claude Code or another):
 
 - A chip beside the context circle, with a card behind it that breaks the cost down and charts every call.
-- A Burn tab in the side panel that lists every prompt and adds the cost of child threads, such as minions.
-- A Burn page in bb's navigation with spend across all threads by day, project, model and harness.
+- A Burn tab in the side panel that charts cumulative thread spend, lists every prompt, and adds the cost of child threads, such as minions.
+- A Burn page in bb's navigation with spend across threads by day, project, model and harness. The Day view charts cumulative spend from hourly records.
 
 <table>
   <tr>
@@ -23,7 +23,7 @@ Burn puts a cost pill such as `$4.82 +$0.31` in pi's footer and in bb's prompt b
   </tr>
 </table>
 
-**In pi**, in the terminal, with or without bb:
+**In standalone pi**, in the terminal:
 
 - A pill in pi's status line.
 - A `/burn` overlay with four views: an overview, what each prompt cost, cost by model, and this project's spend across sessions.
@@ -39,7 +39,7 @@ Burn puts a cost pill such as `$4.82 +$0.31` in pi's footer and in bb's prompt b
 
 ## Install
 
-The bb plugin alone is enough in bb. The pi extension is optional: it adds the pill and `/burn` in pi's terminal, and in a bb thread it stops a run at its budget from inside pi, which is faster than stopping it through bb.
+Use the bb plugin in bb and the optional pi extension in standalone pi. The pi extension does not run inside bb, where Burn's plugin owns the display and budget stops.
 
 ```bash
 # bb plugin
@@ -64,7 +64,7 @@ Requirements: bb 0.46 or newer. The pi extension needs pi 1.x, which provides `c
 
 Do not install the bb plugin from npm. The npm package ships only the pi extension, and bb needs the whole repository to build the plugin.
 
-Threads that are already running show their cost as soon as the bb plugin is installed.
+Threads that are already running show their cost as soon as the bb plugin is installed. If a bb-managed pi thread already loaded an older Burn pi extension, restart the thread after updating it so the old extension cannot apply its cached stop policy.
 
 ## Documentation
 

@@ -20,3 +20,11 @@ export function dayDate(day: string, zone: SpendZone = "local"): Date {
   const [y = 1970, m = 1, d = 1] = day.split("-").map(Number);
   return zone === "utc" ? new Date(Date.UTC(y, m - 1, d, 12)) : new Date(y, m - 1, d, 12);
 }
+
+export function dayBounds(day: string, zone: SpendZone): { start: number; end: number } {
+  const start = dayDate(day, zone);
+  const end = new Date(start);
+  return zone === "utc"
+    ? { start: start.setUTCHours(0, 0, 0, 0), end: end.setUTCHours(24, 0, 0, 0) }
+    : { start: start.setHours(0, 0, 0, 0), end: end.setHours(24, 0, 0, 0) };
+}

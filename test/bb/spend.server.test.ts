@@ -1,10 +1,10 @@
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { reportKey, SPEND_PANELS_KEY } from "../../extensions/bb/keys.js";
 import { spendMethods } from "../../extensions/bb/spend/contract.js";
 import { dayDate, localDays } from "../../extensions/bb/spend/days.js";
 import { checkDailyBudget, createSpendHandlers, type SpendDeps } from "../../extensions/bb/spend/server.js";
-import { CALL_TIME_BUCKETS, dayKey, type DayRow, HOUR_MS, type UsageReport } from "../../src/report.js";
+import { CALL_TIME_BUCKETS, dayKey, type DayRow, HOUR_MS, type HourRow, type UsageReport } from "../../src/report.js";
 import { dayRow, modelRow, sampleReport } from "../helpers.js";
 
 const NOW = new Date(2026, 9, 18, 15, 0, 0).getTime();
@@ -30,6 +30,7 @@ const PROJECTS = [
 const disposers: Array<() => void> = [];
 afterEach(() => {
   for (const dispose of disposers.splice(0)) dispose();
+  vi.unstubAllEnvs();
 });
 
 type ModelUse = number | { cost?: number; calls?: number; tokens?: number };
@@ -659,6 +660,126 @@ describe("spend by tokens and calls", () => {
       threads: { thr_aaaaaa01: {}, thr_aaaaaa02: {}, thr_aaaaaa03: {} },
     });
     expect((await s.spend({ range: "7d", projectId: null })).runningCount).toBe(1);
+  });
+});
+
+describe("Day Cost hours", () => {
+  const bucket = (at: number, cost: number): HourRow => ({ hour: at / HOUR_MS, calls: 1, tokens: 100, cost });
+  const utcDay = (day: string, cost: number, hours: HourRow[], over: Partial<UsageReport> = {}): UsageReport =>
+    reportWith([], { utcDays: [dayRow(day, cost, {})], hours, ...over });
+
+  it("combines only the selected project's Day Cost hours and uses the same price mode", async () => {
+    const start = Date.UTC(2026, 9, 17);
+    const key = "2026-10-17";
+    const a = (factor: number) => utcDay(key, 10 * factor, [
+      bucket(start - HOUR_MS, 40 * factor),
+      bucket(start + 2 * HOUR_MS, 3 * factor),
+      bucket(start + HOUR_MS, 2 * factor),
+      bucket(start + 24 * HOUR_MS, 50 * factor),
+    ], { estimated: true });
+    const b = (factor: number) => utcDay(key, 6 * factor, [bucket(start + HOUR_MS, 6 * factor)]);
+    const s = await setup({ reports: {}, threads: { a: {}, b: {}, c: { projectId: "proj_b" } } });
+    s.setNow(start + 36 * HOUR_MS);
+    const reports = async (_since: number, prices?: "settings" | "list") => {
+      const factor = prices === "list" ? 2 : 1;
+      return { entries: [
+        { threadId: "a", report: a(factor) },
+        { threadId: "b", report: b(factor) },
+        { threadId: "c", report: utcDay(key, 9 * factor, [bucket(start + 3 * HOUR_MS, 9 * factor)]) },
+      ], reading: 1 };
+    };
+    const { spend } = createSpendHandlers({ ...s.deps, reports });
+    const input = { range: "today", projectId: "proj_a", tz: "utc", end: key } as const;
+    const discounted = await spend(input);
+    expect(discounted).toMatchObject({ total: 16, reading: 1, estimated: true });
+    expect(discounted.hourlyCost).toEqual({
+      start,
+      end: start + 24 * HOUR_MS,
+      timeZone: "UTC",
+      hours: [{ at: start + HOUR_MS, cost: 8 }, { at: start + 2 * HOUR_MS, cost: 3 }],
+      omittedBoundaryCost: false,
+      budget: null,
+    });
+    expect(spendMethods.spend.output.parse(discounted).hourlyCost).toEqual(discounted.hourlyCost);
+    const list = await spend({ ...input, listPrice: true });
+    expect(list).toMatchObject({ total: 32, listPrice: true, hourlyCost: { hours: [
+      { at: start + HOUR_MS, cost: 16 }, { at: start + 2 * HOUR_MS, cost: 6 },
+    ] } });
+    for (const range of ["7d", "30d"] as const) expect(await spend({ ...input, range })).not.toHaveProperty("hourlyCost");
+    for (const metric of ["tokens", "calls"] as const) expect(await spend({ ...input, metric })).not.toHaveProperty("hourlyCost");
+  });
+
+  it("ends the current Day at the request time, and distinguishes missing hours from the Day total", async () => {
+    const start = Date.UTC(2026, 9, 18);
+    const s = await setup({
+      reports: {
+        a: utcDay("2026-10-18", 4, [bucket(start + 2 * HOUR_MS, 4), bucket(start + 3 * HOUR_MS, 9)]),
+        b: utcDay("2026-10-18", 5, [], { estimated: true }),
+      },
+      threads: { a: { projectId: "proj_a" }, b: { projectId: "proj_b" } },
+    });
+    const now = start + 2.5 * HOUR_MS;
+    s.setNow(now);
+    expect(await s.spend({ range: "today", projectId: "proj_a", tz: "utc" })).toMatchObject({ total: 4, hourlyCost: {
+      start, end: now, hours: [{ at: start + 2 * HOUR_MS, cost: 4 }],
+    } });
+    expect(await s.spend({ range: "today", projectId: "proj_b", tz: "utc" })).toMatchObject({ total: 5, estimated: true, hourlyCost: { hours: [] } });
+  });
+
+  it("uses the 25 elapsed hours of a fall-back day without folding the repeated hour, and keeps UTC separate", async () => {
+    vi.stubEnv("TZ", "America/Toronto");
+    const start = Date.UTC(2026, 10, 1, 4);
+    const end = Date.UTC(2026, 10, 2, 5);
+    const key = "2026-11-01";
+    const rows = [bucket(start - HOUR_MS, 4), bucket(start + HOUR_MS, 1), bucket(start + 2 * HOUR_MS, 2)];
+    const s = await setup({
+      reports: { a: reportWith([dayRow(key, 3, {})], { utcDays: [dayRow(key, 7, {})], hours: rows }) },
+      threads: { a: {} },
+    });
+    s.setNow(end + 12 * HOUR_MS);
+    const input = { range: "today", projectId: null, end: key } as const;
+    const local = await s.spend(input);
+    expect(local.hourlyCost).toMatchObject({ start, end, timeZone: "America/Toronto", hours: [
+      { at: start + HOUR_MS, cost: 1 }, { at: start + 2 * HOUR_MS, cost: 2 },
+    ] });
+    expect(local.activity[0]?.hours[1]).toBe(3);
+    const utc = await s.spend({ ...input, tz: "utc" });
+    expect(utc.hourlyCost).toMatchObject({ start: start - 4 * HOUR_MS, end: end - 5 * HOUR_MS, timeZone: "UTC", hours: [
+      { at: start - HOUR_MS, cost: 4 }, { at: start + HOUR_MS, cost: 1 }, { at: start + 2 * HOUR_MS, cost: 2 },
+    ] });
+  });
+
+  it("offers a chart budget only for the latest local Day at discounted prices across all projects", async () => {
+    const s = await setup({ reports: {}, threads: {}, daily: 50 });
+    const input = { range: "today", projectId: null } as const;
+    expect(await s.spend(input)).toMatchObject({ dailyBudget: 50, hourlyCost: { budget: 50 } });
+    for (const other of [{ tz: "utc" }, { projectId: "proj_a" }, { listPrice: true }, { end: ago(1) }] as const) {
+      expect(await s.spend({ ...input, ...other })).toMatchObject({ hourlyCost: { budget: null } });
+    }
+  });
+
+  it("omits indivisible cost in the hours straddling a fractional-offset midnight", async () => {
+    vi.stubEnv("TZ", "Asia/Kathmandu");
+    const hour = Date.UTC(2026, 9, 17, 18);
+    const key = "2026-10-18";
+    const s = await setup({
+      reports: { a: reportWith([dayRow(key, 6, {})], { hours: [
+        bucket(hour, 2), bucket(hour + HOUR_MS, 1), bucket(hour + 24 * HOUR_MS, 3),
+      ] }) },
+      threads: { a: {} },
+    });
+    s.setNow(hour + 36 * HOUR_MS);
+    expect(await s.spend({ range: "today", projectId: null, end: key })).toMatchObject({
+      total: 6,
+      hourlyCost: {
+        start: hour + HOUR_MS / 4,
+        end: hour + 24.25 * HOUR_MS,
+        timeZone: new Intl.DateTimeFormat(undefined, { timeZone: "Asia/Kathmandu" }).resolvedOptions().timeZone,
+        hours: [{ at: hour + HOUR_MS, cost: 1 }],
+        omittedBoundaryCost: true,
+        budget: null,
+      },
+    });
   });
 });
 

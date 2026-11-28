@@ -1,5 +1,5 @@
 import { CALL_TIME_EDGES_MS, dayKey, HOUR_MS, type HourRow } from "../../../src/report.js";
-import type { SpendMetric, SpendZone } from "./contract.js";
+import type { SpendMetric, SpendOutput, SpendZone } from "./contract.js";
 
 export interface Usage {
   cost: number;
@@ -63,4 +63,25 @@ export function activityGrid(
     row[col] = (row[col] ?? 0) + h[metric];
   }
   return days.map((day) => ({ day, hours: rows.get(day) ?? new Array<number>(24).fill(0) }));
+}
+
+export function hourlyCosts(
+  hours: readonly HourRow[],
+  start: number,
+  midnight: number,
+  now: number,
+): Pick<NonNullable<SpendOutput["hourlyCost"]>, "hours" | "omittedBoundaryCost"> {
+  const cutoff = Math.min(midnight, now);
+  const sums = new Map<number, number>();
+  let omittedBoundaryCost = false;
+  for (const { hour, cost } of hours) {
+    const at = hour * HOUR_MS;
+    if (cost === 0 || at >= cutoff || at + HOUR_MS <= start) continue;
+    if (at < start || at + HOUR_MS > midnight) {
+      omittedBoundaryCost = true;
+      continue;
+    }
+    sums.set(at, (sums.get(at) ?? 0) + cost);
+  }
+  return { hours: [...sums].sort(([a], [b]) => a - b).map(([at, cost]) => ({ at, cost })), omittedBoundaryCost };
 }

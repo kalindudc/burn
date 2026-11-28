@@ -4,7 +4,9 @@ import { loadPluginApp, type RenderedSlot, renderSlot } from "@get-bb/plugin-sdk
 import { fireEvent, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { rpcContract } from "../../extensions/bb/contract.js";
-import { modelRow, sampleReport } from "../helpers.js";
+import { applyDiscounts } from "../../src/discounts.js";
+import { buildReport, HOUR_MS } from "../../src/report.js";
+import { assistant, modelRow, sampleReport } from "../helpers.js";
 import { answer, backend, CHILD, THREAD } from "./fixtures.js";
 
 vi.mock("sonner", () => ({ toast: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn(), warning: vi.fn() }) }));
@@ -103,6 +105,41 @@ describe("the Burn panel", () => {
     expect(slot.getByTestId("family-total").textContent).toBe("Total46 calls~$6.64");
   });
 
+  it("places thread-only spend after the notices and before Turns, with a readable estimate", async () => {
+    const report = sampleReport({ estimated: true, coverageNote: "Some calls are unpriced." });
+    const server = backend(() => answer({ report, family: FAMILY, budget: { amount: 2, source: "thread" } }));
+    const slot = await renderPanel(server);
+    const section = slot.getByRole("region", { name: "Spend over time" });
+    const chart = within(section).getByRole("img", { name: /this thread.*~\$1\.03.*local time.*\$2 thread budget/i });
+    expect(chart.querySelector("polyline")?.getAttribute("stroke-dasharray")).toBeTruthy();
+    expect(within(section).getByText(/~\$3\.79.*not plotted/i)).toBeTruthy();
+    expect(within(section).getByText("Budget $2")).toBeTruthy();
+    expect(section.previousElementSibling).toBe(slot.getByTestId("estimated"));
+    expect(section.nextElementSibling?.contains(slot.getByTestId("turns"))).toBe(true);
+    expect(server.calls).toEqual([{ method: "usage", input: { threadId: THREAD } }]);
+  });
+
+  it.each([
+    ["token-only", () => buildReport([assistant(0)], null), "No priced spend to plot."],
+    ["fully discounted", () => applyDiscounts(buildReport([assistant(5)], null), { input: 100, output: 100, cacheRead: 100, cacheWrite: 100 }), "No priced spend to plot."],
+    ["untimed", () => sampleReport({ hours: [], series: [] }), /\$4\.82.*not plotted/i],
+  ] as const)("offers an honest fallback for a %s report", async (_name, makeReport, fallback) => {
+    const slot = await renderPanel(backend(() => answer({ report: makeReport() })));
+    const section = within(slot.getByRole("region", { name: "Spend over time" }));
+    expect(section.queryByRole("img")).toBeNull();
+    expect(section.getByText(fallback)).toBeTruthy();
+  });
+
+  it("plots priced non-call usage even without model calls and omits the family budget guide", async () => {
+    const base = sampleReport();
+    const report = { ...base, calls: 0, series: [], hours: [{ hour: Math.floor(base.startedAt / HOUR_MS), calls: 0, tokens: 1, cost: 4.82 }] };
+    const slot = await renderPanel(backend(() => answer({ report, budget: { amount: 3, source: "thread", includeChildren: true } })));
+    const section = within(slot.getByRole("region", { name: "Spend over time" }));
+    expect(section.getByRole("img", { name: /\$4\.82/ })).toBeTruthy();
+    expect(section.getByText(/hourly amounts are spread/i)).toBeTruthy();
+    expect(section.queryByText(/Budget \$/)).toBeNull();
+  });
+
   it("lists turns newest first or costliest first, with the outlier in the warning tone", async () => {
     const slot = await renderPanel(backend());
     expect(turnRows(slot)).toEqual(["4", "3", "2", "1"]);
@@ -197,15 +234,22 @@ describe("the Burn panel", () => {
   });
 
   it("switches between discounted figures and list price, with no budget share at list price", async () => {
-    const budget = { amount: 10, source: "setting" as const };
-    const atList = sampleReport({ cost: { ...sampleReport().cost, total: 5.74 } });
-    const server = backend(undefined, { usage: ({ listPrice }) => answer({ budget, report: listPrice ? atList : sampleReport() }) });
+    const budget = { amount: 9, source: "setting" as const };
+    const base = sampleReport();
+    const fullHistory = (price: number) => sampleReport({
+      cost: { ...base.cost, total: price },
+      hours: [{ hour: Math.floor(base.startedAt / HOUR_MS), calls: 23, tokens: 100, cost: price }],
+    });
+    const server = backend(undefined, { usage: ({ listPrice }) => answer({ budget, report: fullHistory(listPrice ? 5.74 : 4.82) }) });
     const slot = await renderPanel(server, null, { discount: 16 });
     const prices = () => within(slot.getByRole("group", { name: "Prices" }));
     const note = () => slot.getByTestId("price-note").textContent;
+    const chart = () => within(slot.getByRole("region", { name: "Spend over time" }));
+    expect(chart().getByRole("img", { name: /\$4\.82/ })).toBeTruthy();
     expect(note()).toBe("After the discounts in Burn's settings.");
     expect(slot.getByTestId("kpis").textContent).toContain("This thread$4.82");
-    expect(slot.getByTestId("kpis").textContent).toContain("48% of $10 budget");
+    expect(slot.getByTestId("kpis").textContent).toContain("54% of $9 budget");
+    expect(chart().getByText("Budget $9")).toBeTruthy();
     expect(server.callsTo("usage").map((c) => c.input)).toEqual([{ threadId: THREAD }]);
 
     const pressed = prices().getByRole("button", { name: "List price" });
@@ -216,12 +260,15 @@ describe("the Burn panel", () => {
     // The switch stays mounted while the list-price answer loads.
     expect(pressed.isConnected).toBe(true);
     expect(slot.container.textContent).not.toMatch(/% of/);
+    expect(chart().getByRole("img", { name: /\$5\.74/ })).toBeTruthy();
+    expect(chart().queryByText("Budget $9")).toBeNull();
 
     fireEvent.click(prices().getByRole("button", { name: "With discounts" }));
     await vi.waitFor(() => expect(server.callsTo("usage").at(-1)?.input).toEqual({ threadId: THREAD }));
     expect(note()).toBe("After the discounts in Burn's settings.");
     await vi.waitFor(() => expect(slot.getByTestId("kpis").textContent).toContain("This thread$4.82"));
-    expect(slot.getByTestId("kpis").textContent).toContain("48% of $10 budget");
+    expect(slot.getByTestId("kpis").textContent).toContain("54% of $9 budget");
+    expect(chart().getByText("Budget $9")).toBeTruthy();
   });
 
   it("notes a run Burn stopped", async () => {

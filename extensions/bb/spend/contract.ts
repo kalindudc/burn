@@ -54,6 +54,19 @@ export const spendOutputSchema = z.object({
     p50: amount.nullable(),
     p90: amount.nullable(),
   }),
+  /** Day Cost only: known dollar amounts in UTC hour buckets, not reconciled to the day total. */
+  hourlyCost: z.object({
+    start: z.number().int(),
+    /** End of the calendar day, or the request time if the day is in progress. */
+    end: z.number().int(),
+    /** The server calendar's IANA zone, or null if the runtime cannot name it. */
+    timeZone: z.string().nullable(),
+    /** `at` is the start of the bucket, in epoch milliseconds. Even a historic offset change spans at most 48 hours. */
+    hours: z.array(z.object({ at: z.number().int(), cost: amount })).max(48),
+    omittedBoundaryCost: z.boolean(),
+    /** Only the newest local Day for all projects at discounted prices matches the daily budget. */
+    budget: amount.nullable(),
+  }).optional(),
   /** Each day's use per hour of the day, in `metric`. */
   activity: z.array(z.object({ day: z.string(), hours: z.array(amount).length(24) })),
   threads: z.array(

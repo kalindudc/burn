@@ -1,8 +1,8 @@
 ## What you get
 
 - **A cost chip under the prompt box**, beside the context circle. It shows the thread's total and, while the thread works, what the last prompt added, for example `$4.27 +$0.30`. Click it for a card with where the money went (input, cache write, cache read and output), a bar for every model call, the models used, and the total with the thread's child threads, such as minions. From the card you can set a budget, open the Burn tab or copy a summary. On a phone, a flame in the thread header opens the same card while the prompt box is collapsed.
-- **A Burn tab in the side panel** that lists every prompt with its cost, newest or costliest first, and every child thread with its model, calls and cost.
-- **A Burn page in bb's navigation** with spend across all threads for today, the last 7 days or the last 30 days, or any earlier day, 7 days or 30 days, for every project or one. It ranks by cost, tokens or calls, and shows spend per day by model, the token mix against what it cost, call times, the busiest hours, the costliest threads, a table of models, and spend by project and by harness.
+- **A Burn tab in the side panel** that charts the thread's cumulative spend, lists every prompt with its cost, and shows each child thread's model, calls and cost.
+- **A Burn page in bb's navigation** with spend across all threads for today, the last 7 days or the last 30 days, or any earlier day, 7 days or 30 days, for every project or one. The Day view charts cumulative spend by hour. The page ranks by cost, tokens or calls, and shows spend per day by model, the token mix against what it cost, call times, the busiest hours, the costliest threads, a table of models, and spend by project and by harness.
 - **A Cost entry in every thread menu**, and a red flame in the sidebar on threads over their budget.
 
 ## Budgets
@@ -15,7 +15,7 @@ Burn counts every thread, whatever harness runs it. For pi threads it reads the 
 
 ## The pi extension (optional)
 
-The same repository ships a pi extension, installed separately with `pi install git:github.com/kalindudc/burn`. It adds a cost pill to pi's status line and a `/burn` overlay in the terminal, with or without bb. In a bb thread it also stops a run at its budget from inside pi, which is quicker than stopping it through bb. The bb plugin works without it.
+The same repository ships a pi extension, installed separately with `pi install git:github.com/kalindudc/burn`. It adds a cost pill and a `/burn` overlay to standalone pi. It stays inactive inside bb, where the bb plugin owns cost tracking and budget stops.
 
 ## Requirements and limits
 

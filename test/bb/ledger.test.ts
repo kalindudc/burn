@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { harnessOf } from "../../extensions/bb/harnesses.js";
+import { harnessOf, harnessWithPrices } from "../../extensions/bb/harnesses.js";
 import { addRows, type EventRow, ledgerEntries, newLedger, splitTokens, type Totals } from "../../extensions/bb/ledger.js";
 import { isTokenOnly } from "../../src/format.js";
 import { ANTHROPIC_PRICES, OPENAI_CODEX_PRICES } from "../../src/prices.js";
@@ -27,6 +27,16 @@ describe("harnessOf", () => {
     expect(harnessOf("acp-cursor")).toEqual({ reader: "events", prices: null, cacheInInput: null, perCall: false });
     expect(harnessOf("constructor")).toEqual(harnessOf("acp-cursor"));
   });
+});
+
+it("applies model overrides to standard token events and prefers a provider's recorded bill", () => {
+  const h = harnessWithPrices("acp-other", { custom: { input: 2, output: 10, cacheRead: 0, cacheWrite: 0 } });
+  const state = newLedger();
+  addRows(state, [request("go", "custom"), usage(totals({ inputTokens: 1000, outputTokens: 100, totalTokens: 1100 }))], h);
+  const report = () => buildReport(ledgerEntries(state, "acp-other", h), null);
+  expect(report().cost.total).toBeCloseTo(0.003, 12);
+  addRows(state, [cost(0.05)], h);
+  expect(report().cost.total).toBeCloseTo(0.05, 12);
 });
 
 describe("splitTokens", () => {

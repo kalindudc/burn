@@ -11,15 +11,15 @@ const threadId = z.string().regex(THREAD_ID);
 
 /**
  * What the server asks the Burn host entry on each machine. `harness` names the
- * agent whose usage to read: pi, OMP or Claude session logs, or opencode's database.
+ * agent whose usage to read: a session log or a provider database on that host.
  */
 export const hostContract = defineRpcContract({
   reports: {
     input: z.object({
-      harness: z.enum(["pi", "omp", "opencode", "claude"]),
+      harness: z.enum(["pi", "omp", "opencode", "claude", "antigravity"]),
       /** The bb server's IANA zone, so `days` are its local days whatever the host's zone. */
       timeZone: z.string().max(100),
-      /** Burn's price overrides from settings, for the Claude reader, which prices tokens itself. */
+      /** Burn's price overrides from settings, for readers that price recorded tokens. */
       prices: z
         .record(
           z.string().max(200),
